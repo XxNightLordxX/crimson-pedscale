@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crimson RP Ped Scale</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <main id="panel" class="panel hidden">
+        <section class="brand">
+            <div class="mark">CR</div>
+            <div>
+                <p class="eyebrow">Crimson RP</p>
+                <h1>Ped Scale</h1>
+            </div>
+        </section>
+
+        <section class="control">
+            <div class="row">
+                <span>Scale</span>
+                <output id="scaleValue">1.00</output>
+            </div>
+            <input id="scaleSlider" type="range" min="87" max="110" step="1" value="100">
+            <div class="bounds">
+                <span id="minScale">0.87</span>
+                <span id="maxScale">1.10</span>
+            </div>
+        </section>
+
+        <section class="actions">
+            <button id="resetBtn" type="button" class="ghost">Reset</button>
+            <button id="closeBtn" type="button" class="ghost">Close</button>
+            <button id="saveBtn" type="button" class="primary">Save</button>
+        </section>
+    </main>
+
+    <script src="app.js"></script>
+</body>
+</html>
