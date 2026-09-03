@@ -68,11 +68,42 @@ local isPedDowned
 -- ---------------------------------------------------------------------------
 local function stateFlagSet(bag, flags)
     if not bag then return false end
-    for _, flag in ipairs(flags or {}) do
-        local ok, value = pcall(function() return bag[flag] end)
-        if ok and value then return true end
+    -- One pcall around the whole read, not one per flag: statebag indexing can
+    -- throw for a player that has just disconnected.
+    local ok, hit = pcall(function()
+        for _, flag in ipairs(flags or {}) do
+            if bag[flag] then return true end
+        end
+        return false
+    end)
+    return ok and hit or false
+end
+
+-- Statebag reads are comparatively expensive and isPedDowned runs per ped per
+-- frame from shouldScalePed. Cache ONLY the statebag half; the native checks
+-- (IsEntityDead / IsPedFatallyInjured / health) are cheap and stay live so the
+-- safety-critical "do not finish off a downed player" gate is never stale.
+local downedStateCache = {}
+local DOWNED_STATE_TTL_MS = 120
+
+local function downedByStatebag(serverId)
+    local now = GetGameTimer()
+    local entry = downedStateCache[serverId]
+    if entry and (now - entry.at) <= DOWNED_STATE_TTL_MS then
+        return entry.value
     end
-    return false
+
+    local compat = Config.Compat or {}
+    local value
+    if serverId == GetPlayerServerId(PlayerId()) then
+        value = stateFlagSet(LocalPlayer and LocalPlayer.state, compat.LocalStateFlags)
+    else
+        local ok, bag = pcall(function() return Player(serverId).state end)
+        value = ok and stateFlagSet(bag, compat.PlayerStateFlags) or false
+    end
+
+    downedStateCache[serverId] = { at = now, value = value }
+    return value
 end
 
 isPedDowned = function(ped, serverId)
@@ -91,15 +122,7 @@ isPedDowned = function(ped, serverId)
         if health and health <= threshold then return true end
     end
 
-    if serverId and serverId == GetPlayerServerId(PlayerId()) then
-        if stateFlagSet(LocalPlayer and LocalPlayer.state, compat.LocalStateFlags) then
-            return true
-        end
-    elseif serverId then
-        local ok, bag = pcall(function() return Player(serverId).state end)
-        if ok and stateFlagSet(bag, compat.PlayerStateFlags) then return true end
-    end
-
+    if serverId then return downedByStatebag(serverId) end
     return false
 end
 
@@ -795,6 +818,7 @@ RegisterNetEvent('crimson-pedscale:client:removeScale', function(serverId)
     -- one entry per player seen, for the lifetime of the client session.
     groundZCache[serverId] = nil
     remoteAimState[serverId] = nil
+    downedStateCache[serverId] = nil
 end)
 
 RegisterNetEvent('crimson-pedscale:client:openMenu', function(payload)
@@ -1628,6 +1652,7 @@ AddEventHandler('onResourceStop', function(resourceName)
     appliedGroundOffsets = {}
     groundZCache = {}
     traversalState = {}
+    downedStateCache = {}
 end)
 
 AddEventHandler('onResourceStart', function(resourceName)
