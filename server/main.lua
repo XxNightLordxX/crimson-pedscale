@@ -9,6 +9,122 @@ local function debugPrint(message)
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- v45 inbound rate limiting.
+--
+-- Every client-callable event here used to be unauthenticated AND unbounded.
+-- requestData and characterTransition additionally fan out a
+-- TriggerClientEvent(-1) broadcast, so a single client could turn one event
+-- into one packet per connected player -- a 1:N amplification primitive.
+-- ---------------------------------------------------------------------------
+local eventClock = {}   -- [src][eventName] = last accepted GetGameTimer()
+local abuseState = {}   -- [src] = { strikes = n, blockedUntil = ms }
+
+local function rateLimit(src, eventName)
+    local limits = Config.Limits or {}
+    if limits.Enabled == false then return true end
+
+    local now = GetGameTimer()
+    local abuse = abuseState[src]
+    if abuse and abuse.blockedUntil and now < abuse.blockedUntil then
+        return false
+    end
+
+    local cooldown = (limits.PerEventCooldownMs or {})[eventName]
+        or tonumber(limits.DefaultCooldownMs) or 500
+
+    eventClock[src] = eventClock[src] or {}
+    local last = eventClock[src][eventName]
+    if last and (now - last) < cooldown then
+        abuse = abuse or { strikes = 0 }
+        abuse.strikes = (abuse.strikes or 0) + 1
+        if abuse.strikes >= (tonumber(limits.AbuseStrikes) or 8) then
+            abuse.blockedUntil = now + (tonumber(limits.AbusePenaltyMs) or 10000)
+            abuse.strikes = 0
+            debugPrint(('rate-limit penalty applied to %s for %s'):format(src, eventName))
+        end
+        abuseState[src] = abuse
+        return false
+    end
+
+    eventClock[src][eventName] = now
+    if abuse then abuse.strikes = 0 end
+    return true
+end
+
+-- Token bucket for hit reports: bounds a shooter's TOTAL compensation rate
+-- across every target, which the old per-(shooter,target) cooldown did not.
+local hitBuckets = {}
+
+local function consumeHitToken(src)
+    local cfg = (Config.HitboxGuard or {}).RateLimit or {}
+    local burst = tonumber(cfg.Burst) or 5
+    local refill = tonumber(cfg.RefillPerSecond) or 4.0
+    local now = GetGameTimer()
+
+    local bucket = hitBuckets[src]
+    if not bucket then
+        bucket = { tokens = burst, at = now }
+        hitBuckets[src] = bucket
+    end
+
+    local elapsed = math.max(0, now - bucket.at) / 1000.0
+    bucket.tokens = math.min(burst, bucket.tokens + (elapsed * refill))
+    bucket.at = now
+
+    if bucket.tokens < 1.0 then return false end
+    bucket.tokens = bucket.tokens - 1.0
+    return true
+end
+
+-- Forward declaration: buildWeaponDamage is defined further down but is
+-- needed by isAllowedWeapon below. Declaring the local up front means the
+-- reference binds to THIS local rather than to a nil global.
+local buildWeaponDamage
+
+-- Only real firearm groups may ever produce a compensated hit. IsPedShooting
+-- is also true for snowballs, balls, flare guns, petrol cans and fire
+-- extinguishers, all of which previously one-tapped a scaled target.
+local allowedWeaponGroups = nil
+local weaponGroupNativeUsable = nil
+
+local function isAllowedWeapon(weaponHash)
+    if not allowedWeaponGroups then
+        allowedWeaponGroups = {}
+        for _, groupName in ipairs((Config.HitboxGuard or {}).AllowedWeaponGroups or {}) do
+            allowedWeaponGroups[GetHashKey(groupName)] = true
+        end
+    end
+
+    weaponHash = tonumber(weaponHash) or 0
+    if weaponHash == 0 then return false end
+
+    -- GetWeapontypeGroup is not guaranteed to exist on every server build.
+    -- Probe it once. If it is unusable, fall back to the explicit
+    -- WeaponChestDamage whitelist (enforced by chestDamageForWeapon +
+    -- RejectUnknownWeapons) rather than rejecting every weapon and silently
+    -- disabling the guard.
+    if weaponGroupNativeUsable == nil then
+        local probeOk, probeGroup = pcall(GetWeapontypeGroup, GetHashKey('WEAPON_PISTOL'))
+        weaponGroupNativeUsable = probeOk and probeGroup ~= nil and probeGroup ~= 0
+        if not weaponGroupNativeUsable then
+            print('^3[crimson-pedscale]^0 GetWeapontypeGroup unavailable server-side; '
+                .. 'falling back to the explicit WeaponChestDamage whitelist for weapon validation.')
+        end
+    end
+
+    if not weaponGroupNativeUsable then
+        -- Explicit whitelist only: the hash must be configured with damage > 0.
+        local map = buildWeaponDamage()
+        local configured = map[weaponHash]
+        return configured ~= nil and configured > 0
+    end
+
+    local ok, group = pcall(GetWeapontypeGroup, weaponHash)
+    if not ok or not group then return false end
+    return allowedWeaponGroups[group] == true
+end
+
 local function notify(src, message, kind)
     if src and src > 0 then
         if GetResourceState('qbx_core') == 'started' then
@@ -46,23 +162,10 @@ local function isDefaultScale(scale)
     return math.abs((tonumber(scale) or default) - default) < 0.001
 end
 
-local function findIdentifier(src, prefix)
-    local wanted = prefix .. ':'
-    for _, identifier in ipairs(GetPlayerIdentifiers(src)) do
-        if identifier:sub(1, #wanted) == wanted then
-            return identifier
-        end
-    end
-    return nil
-end
-
-local function primaryIdentifier(src)
-    for _, prefix in ipairs(Config.Persistence.IdentifierPriority or {}) do
-        local identifier = findIdentifier(src, prefix)
-        if identifier then return identifier end
-    end
-    return GetPlayerIdentifier(src, 0)
-end
+-- v45: findIdentifier/primaryIdentifier removed. Persistence keys on the
+-- Qbox/QBCore citizenid (see characterIdentifier below), so the license
+-- identifier lookup was unreachable. Config.Persistence.IdentifierPriority is
+-- retained for config compatibility but is no longer consulted.
 
 -- v30: Persist scale by CHARACTER, not by Rockstar/license account.
 -- Qbox/QBCore citizenid is stable per character, so a .87 character can coexist
@@ -246,6 +349,7 @@ end
 
 RegisterNetEvent('crimson-pedscale:server:requestData', function()
     local src = source
+    if not rateLimit(src, 'requestData') then return end
     local citizenid = characterIdentifier(src)
 
     -- Character swaps reuse the same server ID. Clear the previous character's
@@ -267,12 +371,14 @@ end)
 -- same server ID while the character selector/new ped is loading.
 RegisterNetEvent('crimson-pedscale:server:characterTransition', function()
     local src = source
+    if not rateLimit(src, 'characterTransition') then return end
     publishScale(src, scaleDefaults())
     menuGrants[src] = nil
 end)
 
 RegisterNetEvent('crimson-pedscale:server:saveScale', function(scale)
     local src = source
+    if not rateLimit(src, 'saveScale') then return end
     if not canUseMenu(src) then
         debugPrint(('blocked save from %s'):format(src))
         return
@@ -287,6 +393,7 @@ end)
 
 RegisterNetEvent('crimson-pedscale:server:resetScale', function()
     local src = source
+    if not rateLimit(src, 'resetScale') then return end
     if not canUseMenu(src) then
         debugPrint(('blocked reset from %s'):format(src))
         return
@@ -388,7 +495,7 @@ RegisterCommand(Config.Commands.ResetScale, function(src, args)
     end
 end, Config.Permission.RestrictCommandsWithAce == true)
 
-local function buildWeaponDamage()
+function buildWeaponDamage()
     if weaponDamageByHash then return weaponDamageByHash end
 
     weaponDamageByHash = {}
@@ -403,97 +510,111 @@ local function chestDamageForWeapon(weaponHash)
     local map = buildWeaponDamage()
     local configured = map[tonumber(weaponHash)]
     if configured ~= nil then return configured end
+
+    -- v45: an unlisted hash used to fall back to DefaultChestDamage (50),
+    -- which meant ANY weapon -- including garbage hashes a modified client
+    -- invented -- registered as a hit. Reject by default instead.
+    if Config.HitboxGuard.RejectUnknownWeapons ~= false then return 0 end
     return tonumber(Config.HitboxGuard.DefaultChestDamage) or 0
 end
 
-RegisterNetEvent('crimson-pedscale:server:visualHeadHit', function(targetId, weaponHash)
-    if not Config.HitboxGuard.Enabled or (Config.HitboxGuard.Head or {}).Enabled == false then return end
+-- Shared validation for both hit-report events. Returns the damage to apply,
+-- or nil when the report must be discarded.
+local function validateHitReport(src, targetId, weaponHash, eventName)
+    if not Config.HitboxGuard.Enabled then return nil end
 
-    local src = source
     targetId = tonumber(targetId)
     weaponHash = tonumber(weaponHash)
+    if not targetId or not weaponHash or targetId == src then return nil end
+    if not GetPlayerName(targetId) or not GetPlayerName(src) then return nil end
 
-    if not targetId or not weaponHash or targetId == src then return end
-    if not GetPlayerName(targetId) or not GetPlayerName(src) then return end
-
-    -- Use the same per-shooter/target rate limit as chest compensation.
-    local now = GetGameTimer()
-    local cooldown = tonumber(Config.HitboxGuard.ServerCooldownMs) or 95
-    lastVisualHit[src] = lastVisualHit[src] or {}
-    if lastVisualHit[src][targetId] and now - lastVisualHit[src][targetId] < cooldown then
-        return
+    -- Bound the shooter's total report rate across every target.
+    if not consumeHitToken(src) then
+        debugPrint(('%s: rate limited %s'):format(eventName, src))
+        return nil
     end
-    lastVisualHit[src][targetId] = now
-
-    if Config.HitboxGuard.OnlyScaledTargets then
-        local targetScale = playerScales[targetId] or loadPlayerScale(targetId)
-        if isDefaultScale(targetScale) then return end
-    end
-
-    -- Reject weapons that this resource explicitly considers non-damaging
-    -- (stun guns are configured as 0), and reject absurdly distant reports.
-    local damage = chestDamageForWeapon(weaponHash)
-    if damage <= 0 then return end
-
-    local shooterPed = GetPlayerPed(src)
-    local targetPed = GetPlayerPed(targetId)
-    if shooterPed == 0 or targetPed == 0 then return end
-
-    local maxDistance = tonumber(Config.HitboxGuard.RayDistance) or 220.0
-    if #(GetEntityCoords(shooterPed) - GetEntityCoords(targetPed)) > (maxDistance + 5.0) then
-        return
-    end
-
-    local ok, selectedWeapon = pcall(GetSelectedPedWeapon, shooterPed)
-    if ok and selectedWeapon and selectedWeapon ~= 0 and selectedWeapon ~= weaponHash then
-        return
-    end
-
-    TriggerClientEvent('crimson-pedscale:client:applyVisualHeadshot', targetId, src, weaponHash)
-end)
-
-RegisterNetEvent('crimson-pedscale:server:visualChestHit', function(targetId, weaponHash)
-    if not Config.HitboxGuard.Enabled then return end
-
-    local src = source
-    targetId = tonumber(targetId)
-    weaponHash = tonumber(weaponHash)
-
-    if not targetId or not weaponHash or targetId == src then return end
-    if not GetPlayerName(targetId) or not GetPlayerName(src) then return end
 
     local now = GetGameTimer()
     local cooldown = tonumber(Config.HitboxGuard.ServerCooldownMs) or 95
     lastVisualHit[src] = lastVisualHit[src] or {}
     if lastVisualHit[src][targetId] and now - lastVisualHit[src][targetId] < cooldown then
-        return
+        return nil
     end
     lastVisualHit[src][targetId] = now
 
-    if Config.HitboxGuard.OnlyScaledTargets then
-        local targetScale = playerScales[targetId] or loadPlayerScale(targetId)
-        if isDefaultScale(targetScale) then return end
+    -- Weapon must be a real firearm group AND explicitly configured.
+    if not isAllowedWeapon(weaponHash) then
+        debugPrint(('%s: rejected non-firearm weapon %s from %s'):format(eventName, weaponHash, src))
+        return nil
     end
 
     local damage = chestDamageForWeapon(weaponHash)
     local maxDamage = tonumber(Config.HitboxGuard.MaxDamage) or 250
-    if damage <= 0 or damage > maxDamage then return end
+    if damage <= 0 or damage > maxDamage then return nil end
+
+    if Config.HitboxGuard.OnlyScaledTargets then
+        -- Read the live table only. The old code fell back to
+        -- loadPlayerScale(), doing a synchronous KVP read on the shot path.
+        local targetScale = playerScales[targetId]
+        if not targetScale or isDefaultScale(targetScale) then return nil end
+    end
 
     local shooterPed = GetPlayerPed(src)
     local targetPed = GetPlayerPed(targetId)
-    if shooterPed == 0 or targetPed == 0 then return end
+    if shooterPed == 0 or targetPed == 0 then return nil end
 
     local maxDistance = tonumber(Config.HitboxGuard.RayDistance) or 220.0
     if #(GetEntityCoords(shooterPed) - GetEntityCoords(targetPed)) > (maxDistance + 5.0) then
-        return
+        return nil
     end
 
+    -- Corroborate the claimed weapon against what the shooter is actually
+    -- holding. GetSelectedPedWeapon is available server-side; treat a failed
+    -- read as a REJECT rather than silently accepting, which is what the old
+    -- `if ok and ...` shape did.
     local ok, selectedWeapon = pcall(GetSelectedPedWeapon, shooterPed)
-    if ok and selectedWeapon and selectedWeapon ~= 0 and selectedWeapon ~= weaponHash then
-        return
+    if not ok or not selectedWeapon or selectedWeapon == 0 then return nil end
+    if selectedWeapon ~= weaponHash then
+        debugPrint(('%s: weapon mismatch from %s'):format(eventName, src))
+        return nil
     end
 
-    TriggerClientEvent('crimson-pedscale:client:applyVisualChestDamage', targetId, damage, src, weaponHash)
+    return damage
+end
+
+-- v45: a head report no longer commands a kill.
+--
+-- The old handler relayed to a victim-side SetEntityHealth(ped, 0). That was
+-- a remote-execute primitive -- any player could force any scaled player's
+-- client to zero its own health ~10x/second -- and it produced a death with
+-- no killer, which the medical resource logged as an unknown self-death.
+--
+-- It now relays capped, multiplied DAMAGE through the same corroborated path
+-- as a chest hit, so a lethal shot still resolves through GTA's own damage
+-- and the killer is attributed normally.
+RegisterNetEvent('crimson-pedscale:server:visualHeadHit', function(targetId, weaponHash)
+    local src = source
+    if (Config.HitboxGuard.Head or {}).Enabled == false then return end
+
+    local damage = validateHitReport(src, targetId, weaponHash, 'visualHeadHit')
+    if not damage then return end
+
+    local multiplier = tonumber((Config.HitboxGuard.Head or {}).DamageMultiplier) or 2.5
+    local maxDamage = tonumber(Config.HitboxGuard.MaxDamage) or 250
+    damage = math.min(maxDamage, math.floor((damage * multiplier) + 0.5))
+
+    TriggerClientEvent('crimson-pedscale:client:applyVisualDamage',
+        tonumber(targetId), damage, src, tonumber(weaponHash), true)
+end)
+
+RegisterNetEvent('crimson-pedscale:server:visualChestHit', function(targetId, weaponHash)
+    local src = source
+
+    local damage = validateHitReport(src, targetId, weaponHash, 'visualChestHit')
+    if not damage then return end
+
+    TriggerClientEvent('crimson-pedscale:client:applyVisualDamage',
+        tonumber(targetId), damage, src, tonumber(weaponHash), false)
 end)
 
 AddEventHandler('playerDropped', function()
@@ -501,5 +622,27 @@ AddEventHandler('playerDropped', function()
     playerScales[src] = nil
     menuGrants[src] = nil
     lastVisualHit[src] = nil
+    eventClock[src] = nil
+    abuseState[src] = nil
+    hitBuckets[src] = nil
+
+    -- v45: also drop this player as a TARGET in every other shooter's table.
+    -- Previously only lastVisualHit[dropped] was freed, so the inner tables
+    -- grew unbounded with attacker-chosen ids for the server's lifetime.
+    for _, targets in pairs(lastVisualHit) do
+        targets[src] = nil
+    end
+
     TriggerClientEvent('crimson-pedscale:client:removeScale', -1, src)
+end)
+
+AddEventHandler('onResourceStart', function(resourceName)
+    if resourceName ~= GetCurrentResourceName() then return end
+    ReportPedScaleConfig('server')
+
+    if Config.HitboxGuard.Enabled then
+        print('^3[crimson-pedscale]^0 HitboxGuard is ENABLED. It is client-authoritative: '
+            .. 'a modified client can report hits it never fired. Compensation is capped and '
+            .. 'rate limited, but not eliminated. See the README before running this live.')
+    end
 end)

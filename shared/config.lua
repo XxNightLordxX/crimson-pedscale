@@ -13,8 +13,20 @@ Config.Permission = {
     -- Set true if every player may open /pedscale for themselves.
     AllowEveryoneSelfMenu = false,
 
-    -- Also let FiveM block the commands before the script handler runs.
-    RestrictCommandsWithAce = true,
+    -- Ask FiveM to block the commands before the script handler runs.
+    --
+    -- IMPORTANT: RegisterCommand(name, fn, true) makes FiveM check the ace
+    -- object `command.<name>` -- NOT Config.Permission.Ace. Leaving this true
+    -- while only granting `crimson.pedscale` blocks all four commands for
+    -- everyone, which is why it now defaults to false. The in-handler
+    -- permission check below still runs either way, so false is safe.
+    --
+    -- Set this back to true ONLY if you also add, for every command name:
+    --   add_ace group.admin command.pedscale allow
+    --   add_ace group.admin command.givepedscale allow
+    --   add_ace group.admin command.setpedscale allow
+    --   add_ace group.admin command.resetpedscale allow
+    RestrictCommandsWithAce = false,
 
     -- Recommended: add_ace group.admin crimson.pedscale allow
     UseAce = true,
@@ -182,10 +194,89 @@ Config.Scale = {
         MaxDownwardVelocity = -2.50
     },
 
+    -- v40 short-ped tackle handling, reworked in v45.
+    --
+    -- v40-v44 restored the local player's health whenever a short ped took
+    -- ANY non-firearm damage inside a 900 ms window that re-armed whenever
+    -- another player stood within 2.35 m. Because "non-firearm" covered
+    -- melee, thrown, explosive, fire, vehicle and fall damage, that was an
+    -- indefinitely re-armable damage-immunity window -- a godmode bug, and
+    -- exactly the pattern a server anticheat looks for.
+    --
+    -- v45 removes the health write entirely. The bogus upward impulse that
+    -- caused the original problem is dealt with where it belongs: by
+    -- clamping VELOCITY, which this guard already did.
+    TackleGuard = {
+        Enabled = true,
+        NearbyPlayerRadius = 2.35,
+        PhysicsWindowMs = 900,
+        MaxUpwardVelocity = 0.08,
+        -- Poll interval while a short ped is idle. The old code spun at
+        -- Wait(0) permanently for every scaled player.
+        IdlePollMs = 120,
+
+        -- Left for reference; v45 never restores health under any setting.
+        -- Kept so an existing config file does not error on load.
+        RestoreHealth = false
+    },
+
     -- Matrix scaling peds inside vehicles is prone to visual jitter.
     DisableInVehicles = true,
     DisableWhenInvisible = true,
     DisableWhenDead = true
+}
+
+-- v45 compatibility layer.
+--
+-- Medical resources (qbx_medical, sc-ambulance, qb-ambulancejob, ...) keep a
+-- "downed" player's ped ALIVE -- they call NetworkResurrectLocalPlayer and
+-- then set health to a non-zero value so the ped can play a bleed-out
+-- animation. IsEntityDead() is therefore FALSE for the whole last-stand and
+-- even the fully-dead window.
+--
+-- Config.Scale.DisableWhenDead relies on IsEntityDead, so without this
+-- layer the scaler keeps ground-anchoring a prone body and the hitbox guard
+-- keeps treating a bleeding-out player as a valid target -- which let a
+-- downed player be finished off, skipping the EMS revive window entirely.
+--
+-- Nothing here modifies another resource. It only READS state those
+-- resources already publish.
+Config.Compat = {
+    -- Statebags to consult on the LOCAL player. Checked with
+    -- LocalPlayer.state[<name>]; any truthy value means "downed".
+    LocalStateFlags = { 'dead', 'isDead', 'laststand', 'inLaststand', 'buckled' },
+
+    -- Statebags to consult on OTHER players, via Player(serverId).state.
+    PlayerStateFlags = { 'dead', 'isDead', 'laststand', 'inLaststand' },
+
+    -- Also treat a ped as downed when GTA itself reports it fatally injured.
+    UseIsPedFatallyInjured = true,
+
+    -- Health at or below this counts as downed even if no statebag is set.
+    -- Medical resources commonly park last-stand players at a fixed value.
+    DownedHealthThreshold = 1
+}
+
+-- v45 inbound event rate limiting (server side).
+--
+-- Every client-callable event used to be unauthenticated AND unbounded, and
+-- requestData / characterTransition each fan out a TriggerClientEvent(-1)
+-- broadcast to every player. One client could turn 1 event into N packets.
+Config.Limits = {
+    Enabled = true,
+    -- Minimum milliseconds between accepted calls, per player, per event.
+    PerEventCooldownMs = {
+        requestData = 2000,
+        characterTransition = 1500,
+        saveScale = 750,
+        resetScale = 750
+    },
+    DefaultCooldownMs = 500,
+
+    -- Drop a player's traffic entirely for this long after they exceed the
+    -- allowance repeatedly, so spam cannot be sustained.
+    AbusePenaltyMs = 10000,
+    AbuseStrikes = 8
 }
 
 Config.Persistence = {
@@ -203,7 +294,24 @@ Config.Notifications = {
 Config.HitboxGuard = {
     -- Entity-matrix scaling changes the visual body more than GTA's native
     -- damage capsule. This guard compensates chest shots that visually land.
-    Enabled = true,
+    --
+    -- ############################################################### --
+    -- ##  READ THIS BEFORE SETTING Enabled = true                  ## --
+    -- ############################################################### --
+    --
+    -- This guard is CLIENT-AUTHORITATIVE by design: the shooter's client
+    -- decides it landed a hit, and the victim's client then damages itself.
+    -- FiveM gives the server no way to verify that a shot happened, so a
+    -- modified client can report hits it never fired.
+    --
+    -- v45 removes the instant-kill primitive and adds firearm whitelisting,
+    -- token-bucket rate limiting, damage caps and victim-side corroboration.
+    -- Those bound the abuse; they do not eliminate it. A determined cheater
+    -- can still convert this into a capped damage advantage.
+    --
+    -- It therefore ships DISABLED. Turn it on only if you accept that
+    -- trade-off, and read the "Hitbox guard" section of the README first.
+    Enabled = false,
     OnlyScaledTargets = true,
 
     RayDistance = 220.0,
@@ -213,14 +321,59 @@ Config.HitboxGuard = {
     NativeDamageWindowMs = 350,
     ServerCooldownMs = 95,
 
+    -- v45 hardening ------------------------------------------------------
+    -- Only weapons whose GetWeapontypeGroup is in this set may ever produce
+    -- a compensated hit. This is what stops snowballs, balls, flare guns,
+    -- petrol cans and fire extinguishers from being accepted as gunshots
+    -- (IsPedShooting is true for all of them).
+    AllowedWeaponGroups = {
+        'GROUP_PISTOL', 'GROUP_SMG', 'GROUP_RIFLE',
+        'GROUP_MG', 'GROUP_SHOTGUN', 'GROUP_SNIPER'
+    },
+
+    -- Reject any weapon hash that is not explicitly listed in
+    -- WeaponChestDamage. The old DefaultChestDamage fallback meant ANY
+    -- unlisted or garbage hash was treated as 50 damage.
+    RejectUnknownWeapons = true,
+
+    -- The victim's own client must have independently observed real native
+    -- damage in this window before it will apply any compensation. This is
+    -- the main defence: an attacker who never actually shot produces no
+    -- native damage on the victim, so nothing is applied.
+    RequireNativeCorroboration = true,
+    CorroborationWindowMs = 400,
+
+    -- Hard ceiling on compensation the victim will accept, regardless of
+    -- what the server relays. Prevents burst-kills through any hole above.
+    MaxCompensationPerWindow = 60,
+    CompensationWindowMs = 1000,
+
+    -- Never let compensation reduce the victim below this health. Killing
+    -- blows must come from GTA's own damage so the medical resource sees a
+    -- real death with a real killer.
+    MinHealthAfterCompensation = 2,
+
+    -- Server-side token bucket, per shooter, across ALL targets.
+    RateLimit = {
+        Burst = 5,
+        RefillPerSecond = 4.0
+    },
+
     -- Visual headshot compensation for scaled peds. GTA's native head
     -- capsule stays close to the original 1.00 skeleton even when the ped is
     -- rendered at .87 or 1.10, so aim against the rendered SKEL_Head bone.
-    -- Any valid firearm hit inside this sphere is a one-tap kill.
+    --
+    -- v45: a head hit is NO LONGER an instant kill. The old behaviour was
+    -- SetEntityHealth(ped, 0) driven by a net event from another player,
+    -- which was both a remote-execute primitive and a death with no killer
+    -- (the medical resource logged it as an unknown self-death). It now
+    -- applies a multiplied, capped damage instead, so a lethal shot still
+    -- goes through GTA's own damage path with proper attribution.
     Head = {
         Enabled = true,
         Radius = 0.18,
-        ZOffset = 0.015
+        ZOffset = 0.015,
+        DamageMultiplier = 2.5
     },
 
     Torso = {
@@ -231,7 +384,12 @@ Config.HitboxGuard = {
     },
 
     MaxDamage = 250,
-    DefaultChestDamage = 50,
+
+    -- Fallback for weapons not listed in WeaponChestDamage. This is only
+    -- consulted when RejectUnknownWeapons is false; leaving that true (the
+    -- default) is strongly recommended, because this fallback is what let
+    -- any unlisted hash -- including non-firearms -- register as a hit.
+    DefaultChestDamage = 0,
 
     -- Stun guns are excluded so they do not trigger injury-style damage.
     WeaponChestDamage = {
@@ -262,3 +420,82 @@ Config.HitboxGuard = {
         WEAPON_HEAVYSNIPER = 220
     }
 }
+
+-- ---------------------------------------------------------------------------
+-- v45 config validation.
+--
+-- Previously a bad Config value failed silently (Min > Max quietly swapped,
+-- a nil command name crashed RegisterCommand, an absurd damage value was
+-- accepted). Validate once at start, clamp what can be clamped, and print a
+-- clear warning for what cannot.
+-- ---------------------------------------------------------------------------
+function ValidatePedScaleConfig()
+    local problems = {}
+
+    local function warn(fmt, ...)
+        problems[#problems + 1] = select('#', ...) > 0 and fmt:format(...) or fmt
+    end
+
+    local scale = Config.Scale or {}
+    scale.Min = tonumber(scale.Min) or 0.87
+    scale.Max = tonumber(scale.Max) or 1.10
+    scale.Default = tonumber(scale.Default) or 1.0
+
+    if scale.Min > scale.Max then
+        warn('Scale.Min (%.2f) was greater than Scale.Max (%.2f); swapped.', scale.Min, scale.Max)
+        scale.Min, scale.Max = scale.Max, scale.Min
+    end
+    if scale.Min <= 0.0 then
+        warn('Scale.Min must be > 0; clamped to 0.5.')
+        scale.Min = 0.5
+    end
+    if scale.Default < scale.Min or scale.Default > scale.Max then
+        warn('Scale.Default (%.2f) outside [%.2f, %.2f]; clamped.', scale.Default, scale.Min, scale.Max)
+        scale.Default = math.min(scale.Max, math.max(scale.Min, scale.Default))
+    end
+    scale.RenderDistance = math.max(10.0, tonumber(scale.RenderDistance) or 100.0)
+
+    local commands = Config.Commands or {}
+    for _, key in ipairs({ 'OpenMenu', 'GiveMenu', 'SetScale', 'ResetScale' }) do
+        local name = commands[key]
+        if type(name) ~= 'string' or name == '' then
+            warn('Commands.%s is not a non-empty string; that command is disabled.', key)
+            commands[key] = nil
+        end
+    end
+
+    local guard = Config.HitboxGuard or {}
+    guard.MaxDamage = math.max(1, math.min(1000, tonumber(guard.MaxDamage) or 250))
+    guard.DefaultChestDamage = math.max(0, tonumber(guard.DefaultChestDamage) or 0)
+    if guard.DefaultChestDamage > 0 and guard.RejectUnknownWeapons == false then
+        warn('HitboxGuard: RejectUnknownWeapons=false with DefaultChestDamage=%d lets ANY '
+            .. 'unlisted weapon hash register a hit. This is strongly discouraged.',
+            guard.DefaultChestDamage)
+    end
+    for weaponName, damage in pairs(guard.WeaponChestDamage or {}) do
+        local value = tonumber(damage)
+        if not value or value < 0 or value > guard.MaxDamage then
+            warn('HitboxGuard.WeaponChestDamage.%s (%s) is invalid or above MaxDamage; set to 0.',
+                tostring(weaponName), tostring(damage))
+            guard.WeaponChestDamage[weaponName] = 0
+        end
+    end
+    guard.MaxCompensationPerWindow = math.max(0, tonumber(guard.MaxCompensationPerWindow) or 60)
+    guard.MinHealthAfterCompensation = math.max(0, tonumber(guard.MinHealthAfterCompensation) or 2)
+
+    if guard.Enabled and guard.RequireNativeCorroboration == false then
+        warn('HitboxGuard is enabled with RequireNativeCorroboration=false. The victim will '
+            .. 'then apply damage on a shooter\'s word alone. Do not run this on a live server.')
+    end
+
+    return problems
+end
+
+function ReportPedScaleConfig(sideLabel)
+    local problems = ValidatePedScaleConfig()
+    if #problems == 0 then return end
+    print(('^3[crimson-pedscale]^0 %s config warnings (%d):'):format(sideLabel, #problems))
+    for i = 1, #problems do
+        print(('^3[crimson-pedscale]^0   %d. %s'):format(i, problems[i]))
+    end
+end

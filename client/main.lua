@@ -1,7 +1,7 @@
 local scaleState = {}
+local remoteAimState = {}
 local lastApplied = {}
 local appliedGroundOffsets = {}
-local legIkDisabled = {}
 local uiOpen = false
 local previewScale = nil
 local ownSavedScale = Config.Scale.Default
@@ -34,6 +34,73 @@ end
 local function isDefaultScale(scale)
     local default = scaleDefaults()
     return math.abs((tonumber(scale) or default) - default) < 0.001
+end
+
+-- ---------------------------------------------------------------------------
+-- v45 forward declarations.
+--
+-- Lua binds a free name at COMPILE time. `local function f` at line 980 is not
+-- in scope for a function body written at line 470 -- that body resolves `f`
+-- as a GLOBAL, which is nil. v40-v44 had exactly that bug: applyMatrixScale
+-- guarded on `shortTacklePhysicsActive and shortTacklePhysicsActive()`, the
+-- name was nil, and the `and` silently swallowed it, so the tackle isolation
+-- branch never ran once. Declaring the locals up front binds them correctly.
+-- ---------------------------------------------------------------------------
+local shortTacklePhysicsActive
+local isPedDowned
+
+-- ---------------------------------------------------------------------------
+-- v45 downed / last-stand detection.
+--
+-- Medical resources (qbx_medical, sc-ambulance, qb-ambulancejob) do NOT leave
+-- a downed player's ped dead. They call NetworkResurrectLocalPlayer and set a
+-- non-zero health so the ped can play a bleed-out animation, which means
+-- IsEntityDead() is FALSE for the whole last-stand window and often for the
+-- fully-dead window too.
+--
+-- Config.Scale.DisableWhenDead relied on IsEntityDead alone, so the scaler
+-- kept ground-anchoring a prone body and the hitbox guard kept treating a
+-- bleeding-out player as a live target -- letting a downed player be finished
+-- off and skipping the EMS revive window entirely.
+--
+-- This only READS state other resources already publish. It modifies nothing
+-- outside this resource.
+-- ---------------------------------------------------------------------------
+local function stateFlagSet(bag, flags)
+    if not bag then return false end
+    for _, flag in ipairs(flags or {}) do
+        local ok, value = pcall(function() return bag[flag] end)
+        if ok and value then return true end
+    end
+    return false
+end
+
+isPedDowned = function(ped, serverId)
+    local compat = Config.Compat or {}
+
+    if ped ~= 0 and DoesEntityExist(ped) then
+        if IsEntityDead(ped) then return true end
+
+        if compat.UseIsPedFatallyInjured ~= false then
+            local ok, injured = pcall(IsPedFatallyInjured, ped)
+            if ok and injured then return true end
+        end
+
+        local threshold = tonumber(compat.DownedHealthThreshold) or 1
+        local health = GetEntityHealth(ped)
+        if health and health <= threshold then return true end
+    end
+
+    if serverId and serverId == GetPlayerServerId(PlayerId()) then
+        if stateFlagSet(LocalPlayer and LocalPlayer.state, compat.LocalStateFlags) then
+            return true
+        end
+    elseif serverId then
+        local ok, bag = pcall(function() return Player(serverId).state end)
+        if ok and stateFlagSet(bag, compat.PlayerStateFlags) then return true end
+    end
+
+    return false
 end
 
 local function notify(message)
@@ -131,7 +198,41 @@ local function groundRay(ped, x, y, top, bottom, flags, minNormalZ, rootZ, minBe
     return nil
 end
 
-local function getGroundZUnderPed(ped, position)
+-- v45 ground-ray cache.
+--
+-- desiredRootZ called getGroundZUnderPed every frame for every scaled ped in
+-- render range, and each call issues up to FOUR StartShapeTestRay probes. With
+-- a handful of scaled players in view that is dozens of synchronous probes per
+-- frame, every frame, with no reuse.
+--
+-- Cache the result per ped and only re-probe when the ped has moved
+-- horizontally by more than a few centimetres or the entry has aged out. A
+-- stationary ped reuses its floor height; a moving one re-probes promptly.
+local groundRayCache = {}
+local GROUND_CACHE_TTL_MS = 90
+local GROUND_CACHE_MAX_MOVE = 0.10
+
+local function cachedGroundZ(ped, position, probeFn)
+    local now = GetGameTimer()
+    local entry = groundRayCache[ped]
+
+    if entry and (now - entry.at) <= GROUND_CACHE_TTL_MS then
+        local dx = position.x - entry.x
+        local dy = position.y - entry.y
+        if ((dx * dx) + (dy * dy)) <= (GROUND_CACHE_MAX_MOVE * GROUND_CACHE_MAX_MOVE)
+            and math.abs(position.z - entry.rootZ) <= 0.75 then
+            return entry.groundZ
+        end
+    end
+
+    local value = probeFn(ped, position)
+    groundRayCache[ped] = {
+        at = now, x = position.x, y = position.y, rootZ = position.z, groundZ = value
+    }
+    return value
+end
+
+local function probeGroundZUnderPed(ped, position)
     local ground = Config.Scale.Grounding or {}
     -- v21 doorway fix: doors, frames and threshold props are OBJECT collisions.
     -- When OBJECT and WORLD are tested together, Pillbox-style doors can win the
@@ -182,6 +283,27 @@ local function getGroundZUnderPed(ped, position)
 
     return nil
 end
+
+-- Cached entry point. probeGroundZUnderPed is passed by value, so this never
+-- forward-references a local.
+local function getGroundZUnderPed(ped, position)
+    return cachedGroundZ(ped, position, probeGroundZUnderPed)
+end
+
+-- Drop cache entries for peds that no longer exist. Ped handles are recycled,
+-- so this is a size guard rather than a correctness one (TTL covers staleness).
+local function pruneGroundRayCache()
+    for ped in pairs(groundRayCache) do
+        if not DoesEntityExist(ped) then groundRayCache[ped] = nil end
+    end
+end
+
+CreateThread(function()
+    while true do
+        Wait(15000)
+        pruneGroundRayCache()
+    end
+end)
 
 local function desiredRootZ(ped, scale, position, serverId)
     local ground = Config.Scale.Grounding or {}
@@ -252,11 +374,10 @@ local function desiredRootZ(ped, scale, position, serverId)
     return groundZ + (baseRootHeight * scale) + clearance + tallCorrection + shortCorrection + localShortCorrection + localTallCorrection
 end
 
-local function setScaledLegIk(ped, serverId, scaled)
-    -- Do not repeatedly toggle IK. The absolute ground anchor below gives GTA a
-    -- stable root to solve against and avoids the knee-pumping loop caused by
-    -- changing IK state while the idle/walk animation is running.
-end
+-- v45: setScaledLegIk was an empty stub, so legIkDisabled was never populated
+-- and its restore path in removeScale was unreachable. Both removed. The
+-- absolute ground anchor already gives GTA a stable root to solve leg IK
+-- against, which is why no IK toggling is needed.
 
 local function setScaledMatrixAtZ(ped, scale, forward, right, up, position, z)
     SetEntityMatrix(
@@ -473,7 +594,11 @@ local function applyMatrixScale(ped, scale, serverId)
         return
     end
 
-    if serverId == ownServerId() and shortTacklePhysicsActive and shortTacklePhysicsActive() then
+    -- No `and shortTacklePhysicsActive` nil-guard here on purpose: that guard is
+    -- exactly what silently swallowed the v40-v44 forward-reference bug for four
+    -- releases. The local is forward-declared at the top of the file, so if this
+    -- ever regresses it should raise a visible error rather than quietly no-op.
+    if serverId == ownServerId() and shortTacklePhysicsActive() then
         -- v40 tackle isolation: while a short local ped is tackling/being tackled,
         -- never feed the ped through stair, landing, ledge or ground correction.
         -- Preserve the native root exactly and let GTA own the ragdoll transform.
@@ -559,15 +684,35 @@ local function applyMatrixScale(ped, scale, serverId)
 end
 
 local function clearMatrixScale(ped, serverId)
-    -- Put the basis back to 1.00 once, at the same absolute ground anchor, then
-    -- stop touching it so GTA resumes normal collision/animation placement.
-    local forward, right, up, position = GetEntityMatrix(ped)
-    if forward and right and up and position then
-        forward = normalizeVector(forward)
-        right = normalizeVector(right)
-        up = normalizeVector(up)
-        local targetZ = desiredRootZ(ped, Config.Scale.Default, position, serverId)
-        setScaledMatrixAtZ(ped, Config.Scale.Default, forward, right, up, position, targetZ)
+    -- Put the basis back to 1.00 once, then stop touching it so GTA resumes
+    -- normal collision/animation placement.
+    --
+    -- v45: this used to write desiredRootZ(...) -- a freshly raycast GROUND
+    -- ANCHOR -- rather than the ped's current Z. Because clearMatrixScale runs
+    -- exactly when a ped stops qualifying for scaling (it died, entered a
+    -- vehicle, got attached to a stretcher, or was frozen), that final write
+    -- teleported the ped to the computed floor height. On a frozen or attached
+    -- ped it displaced them permanently.
+    --
+    -- Restore the unit basis AT THE PED'S CURRENT POSITION, and skip entirely
+    -- for peds we must not move.
+    if ped == 0 or not DoesEntityExist(ped) then
+        if serverId then
+            appliedGroundOffsets[serverId] = nil
+            groundZCache[serverId] = nil
+            traversalState[serverId] = nil
+        end
+        return
+    end
+
+    if not IsEntityAttached(ped) and not IsEntityPositionFrozen(ped) then
+        local forward, right, up, position = GetEntityMatrix(ped)
+        if forward and right and up and position then
+            forward = normalizeVector(forward)
+            right = normalizeVector(right)
+            up = normalizeVector(up)
+            setScaledMatrixAtZ(ped, Config.Scale.Default, forward, right, up, position, position.z)
+        end
     end
 
     if serverId then
@@ -575,16 +720,19 @@ local function clearMatrixScale(ped, serverId)
         groundZCache[serverId] = nil
         traversalState[serverId] = nil
     end
-    setScaledLegIk(ped, serverId, false)
 end
 
-local function shouldScalePed(ped)
+local function shouldScalePed(ped, serverId)
     if ped == 0 or not DoesEntityExist(ped) then return false end
     -- v30: Ped scaling/ground calibration is designed for human peds. Animal
     -- peds (dog RP, etc.) have completely different skeleton/root heights and
     -- must never inherit a human character's scale during a character swap.
     if Config.Scale.HumanPedsOnly ~= false and not IsPedHuman(ped) then return false end
-    if Config.Scale.DisableWhenDead and IsEntityDead(ped) then return false end
+    -- v45: DisableWhenDead used to test IsEntityDead only, which is FALSE for
+    -- the whole last-stand and often the fully-dead window on qbx_medical-style
+    -- medical resources (they resurrect the ped and hold it at a fixed health).
+    -- The scaler therefore kept ground-anchoring a prone, bleeding-out body.
+    if Config.Scale.DisableWhenDead and isPedDowned(ped, serverId) then return false end
     if Config.Scale.DisableWhenInvisible and not IsEntityVisible(ped) then return false end
     if Config.Scale.DisableInVehicles and IsPedInAnyVehicle(ped, false) then return false end
     if IsEntityAttached(ped) or IsEntityPositionFrozen(ped) then return false end
@@ -643,14 +791,10 @@ RegisterNetEvent('crimson-pedscale:client:removeScale', function(serverId)
     lastApplied[serverId] = nil
     appliedGroundOffsets[serverId] = nil
     traversalState[serverId] = nil
-    if legIkDisabled[serverId] then
-        local player = GetPlayerFromServerId(serverId)
-        if player ~= -1 then
-            local ped = GetPlayerPed(player)
-            if ped ~= 0 and DoesEntityExist(ped) then SetPedCanLegIk(ped, true) end
-        end
-        legIkDisabled[serverId] = nil
-    end
+    -- v45: groundZCache and remoteAimState were never pruned, so both grew by
+    -- one entry per player seen, for the lifetime of the client session.
+    groundZCache[serverId] = nil
+    remoteAimState[serverId] = nil
 end)
 
 RegisterNetEvent('crimson-pedscale:client:openMenu', function(payload)
@@ -760,69 +904,22 @@ CreateThread(function()
     end
 end)
 
--- v24 doorway camera-object fix.
--- v23 ignored camera collision with the scaled ped itself, but Pillbox-style
--- automatic doors are separate OBJECT entities. GTA's third-person camera can
--- briefly collide with the moving door leaf and spring inward/outward as the
--- player crosses the threshold. Cache nearby objects at a low frequency, then
--- tell the gameplay camera to ignore those OBJECT entities for the current
--- frame while the local player is scaled. Player/world collision is untouched.
-local nearbyCameraObjects = {}
-local nearbyCameraObjectsNextScan = 0
+-- v45: the v24 "doorway camera" helper was removed.
+--
+-- suppressScaledDoorwayCameraCollision and its object-scan helper were never
+-- called from anywhere, Config.Scale.DoorwayCamera.Enabled was already false,
+-- and the scan walked the entire CObject game pool on a timer. The comment
+-- also named the wrong native for hash 0x2AED6301F67007D5.
+--
+-- Config.Scale.DoorwayCamera is retained in config.lua purely so existing
+-- config files keep loading; it no longer does anything.
 
-local function refreshNearbyCameraObjects(localPed, localCoords)
-    local cfg = (Config.Scale and Config.Scale.DoorwayCamera) or {}
-    local now = GetGameTimer()
-    if now < nearbyCameraObjectsNextScan then return end
-
-    nearbyCameraObjectsNextScan = now + (tonumber(cfg.ObjectScanIntervalMs) or 120)
-    nearbyCameraObjects = {}
-
-    local radius = tonumber(cfg.ObjectIgnoreRadius) or 2.35
-    local radiusSq = radius * radius
-    local objects = GetGamePool('CObject')
-    for i = 1, #objects do
-        local object = objects[i]
-        if object ~= 0 and DoesEntityExist(object) and object ~= localPed then
-            local coords = GetEntityCoords(object)
-            local dx = coords.x - localCoords.x
-            local dy = coords.y - localCoords.y
-            local dz = coords.z - localCoords.z
-            local distSq = (dx * dx) + (dy * dy) + (dz * dz)
-            if distSq <= radiusSq then
-                nearbyCameraObjects[#nearbyCameraObjects + 1] = object
-            end
-        end
-    end
-end
-
-local function suppressScaledDoorwayCameraCollision(localPed, localCoords, scale)
-    local cfg = (Config.Scale and Config.Scale.DoorwayCamera) or {}
-    if cfg.Enabled == false or isDefaultScale(scale) then
-        nearbyCameraObjects = {}
-        return
-    end
-
-    -- Keep ignoring our own scaled entity as in v23.
-    Citizen.InvokeNative(0x2AED6301F67007D5, localPed)
-
-    refreshNearbyCameraObjects(localPed, localCoords)
-    for i = 1, #nearbyCameraObjects do
-        local object = nearbyCameraObjects[i]
-        if DoesEntityExist(object) then
-            -- SET_GAMEPLAY_CAM_IGNORE_ENTITY_COLLISION_THIS_UPDATE(Entity)
-            -- Using the per-update native avoids permanently changing the door.
-            Citizen.InvokeNative(0x2AED6301F67007D5, object)
-        end
-    end
-end
 
 CreateThread(function()
     while true do
         local sleep = 250
         local localPed = PlayerPedId()
         local localCoords = GetEntityCoords(localPed)
-        local localScale = effectiveScale(ownServerId())
         local renderDistance = tonumber(Config.Scale.RenderDistance) or 100.0
 
         for _, player in ipairs(GetActivePlayers()) do
@@ -831,7 +928,7 @@ CreateThread(function()
                 local ped = GetPlayerPed(player)
                 local scale = effectiveScale(serverId)
                 local shouldApply = not isDefaultScale(scale)
-                    and shouldScalePed(ped)
+                    and shouldScalePed(ped, serverId)
                     and #(GetEntityCoords(ped) - localCoords) <= renderDistance
 
                 if shouldApply then
@@ -862,7 +959,8 @@ end)
 -- during a short burst when remote free-aim/shooting actually begins. Once the
 -- burst expires we fall back to a light maintenance refresh while the player is
 -- still aiming. Merely carrying a weapon no longer forces animation updates.
-local remoteAimState = {}
+-- remoteAimState is declared at the top of the file so the removeScale /
+-- onResourceStop cleanup paths (which appear earlier) can prune it.
 local unarmedHash = joaat('WEAPON_UNARMED')
 local AIM_START_BURST_MS = 280
 local AIM_MAINTENANCE_MS = 110
@@ -883,7 +981,7 @@ CreateThread(function()
 
                 if scale < 0.999 then
                     local ped = GetPlayerPed(player)
-                    if ped ~= 0 and DoesEntityExist(ped) and shouldScalePed(ped)
+                    if ped ~= 0 and DoesEntityExist(ped) and shouldScalePed(ped, serverId)
                         and #(GetEntityCoords(ped) - localCoords) <= renderDistance then
                         local weapon = GetSelectedPedWeapon(ped)
                         local armed = weapon and weapon ~= 0 and weapon ~= unarmedHash
@@ -975,11 +1073,11 @@ end
 -- velocity, and ignore non-firearm physics damage caused by the launch/landing.
 -- Horizontal velocity and GTA ragdoll are left intact, so the tackle still looks
 -- and feels native.
-local shortTackleGuardUntil = 0
 local shortTacklePhysicsUntil = 0
-local shortTackleProtectedHealth = nil
 
-local function shortTacklePhysicsActive()
+-- Assigns to the local forward-declared at the top of the file, so the
+-- applyMatrixScale tackle branch can actually see it.
+shortTacklePhysicsActive = function()
     return shortTacklePhysicsUntil > GetGameTimer()
 end
 
@@ -1003,63 +1101,73 @@ end
 
 CreateThread(function()
     while true do
-        local ped, scale = scaledLocalPed()
-        if not ped or scale >= 0.999 or IsEntityDead(ped) or IsPedInAnyVehicle(ped, false) then
-            shortTackleGuardUntil = 0
+        local cfg = (Config.Scale and Config.Scale.TackleGuard) or {}
+        local idlePoll = tonumber(cfg.IdlePollMs) or 120
+
+        if cfg.Enabled == false then
             shortTacklePhysicsUntil = 0
-            shortTackleProtectedHealth = nil
-            Wait(100)
-        else
-            local now = GetGameTimer()
-            local vel = GetEntityVelocity(ped)
-            local horizontalSpeed = math.sqrt((vel.x * vel.x) + (vel.y * vel.y))
-            local nearby = hasNearbyPlayerForTackle(ped, 2.35)
-            local deliberateTraversal = IsPedJumping(ped)
-                or IsPedClimbing(ped)
-                or IsPedVaulting(ped)
-                or IsPedFalling(ped)
-            local tackleRagdoll = IsPedRagdoll(ped) or IsPedGettingUp(ped)
-
-            -- Arm BEFORE the ragdoll when the short tackler receives the initial
-            -- upward impulse. Also arm when the short ped is the tackle TARGET
-            -- and enters ragdoll beside another player. A real jump/vault/fall
-            -- never arms this state.
-            local tackleContact = nearby and not deliberateTraversal and (
-                tackleRagdoll
-                or (vel.z > 0.18 and horizontalSpeed > 0.55)
-            )
-
-            if tackleContact then
-                shortTackleGuardUntil = now + 250
-                shortTacklePhysicsUntil = now + 900
-                if shortTackleProtectedHealth == nil then
-                    shortTackleProtectedHealth = GetEntityHealth(ped)
-                else
-                    shortTackleProtectedHealth = math.max(shortTackleProtectedHealth, GetEntityHealth(ped))
-                end
-            elseif shortTacklePhysicsUntil <= now then
-                shortTackleProtectedHealth = nil
-            end
-
-            -- While the tackle/ragdoll is active, keep GTA's horizontal motion
-            -- and ragdoll but remove the matrix/collision-generated skyward kick.
-            -- Do this THROUGH the ragdoll instead of stopping as soon as ragdoll
-            -- begins (the flaw in v32-v39). Downward gravity remains untouched.
-            if shortTacklePhysicsUntil > now then
-                vel = GetEntityVelocity(ped)
-                local maxUp = 0.08
-                if vel.z > maxUp then
-                    SetEntityVelocity(ped, vel.x, vel.y, maxUp)
-                end
-            end
-
-            Wait(0)
+            Wait(500)
+            goto continue
         end
+
+        do
+            local ped, scale = scaledLocalPed()
+            if not ped or scale >= 0.999 or isPedDowned(ped, ownServerId())
+                or IsPedInAnyVehicle(ped, false) then
+                shortTacklePhysicsUntil = 0
+                Wait(idlePoll)
+            else
+                local now = GetGameTimer()
+                local vel = GetEntityVelocity(ped)
+                local horizontalSpeed = math.sqrt((vel.x * vel.x) + (vel.y * vel.y))
+                local radius = tonumber(cfg.NearbyPlayerRadius) or 2.35
+                local nearby = hasNearbyPlayerForTackle(ped, radius)
+                local deliberateTraversal = IsPedJumping(ped)
+                    or IsPedClimbing(ped)
+                    or IsPedVaulting(ped)
+                    or IsPedFalling(ped)
+                local tackleRagdoll = IsPedRagdoll(ped) or IsPedGettingUp(ped)
+
+                -- Arm BEFORE the ragdoll when the short tackler receives the initial
+                -- upward impulse. Also arm when the short ped is the tackle TARGET
+                -- and enters ragdoll beside another player. A real jump/vault/fall
+                -- never arms this state.
+                local tackleContact = nearby and not deliberateTraversal and (
+                    tackleRagdoll
+                    or (vel.z > 0.18 and horizontalSpeed > 0.55)
+                )
+
+                if tackleContact then
+                    shortTacklePhysicsUntil = now + (tonumber(cfg.PhysicsWindowMs) or 900)
+                end
+
+                -- v45: velocity clamping ONLY. The health restore that used to
+                -- live here refunded every kind of non-firearm damage inside a
+                -- re-armable window, which was a godmode bug. Keep GTA's
+                -- horizontal motion and ragdoll, remove only the bogus skyward
+                -- kick the scaled matrix generates. Downward gravity untouched.
+                local active = shortTacklePhysicsUntil > now
+                if active then
+                    vel = GetEntityVelocity(ped)
+                    local maxUp = tonumber(cfg.MaxUpwardVelocity) or 0.08
+                    if vel.z > maxUp then
+                        SetEntityVelocity(ped, vel.x, vel.y, maxUp)
+                    end
+                end
+
+                -- v45: only spin per-frame while a tackle window is actually
+                -- open. The old loop ran Wait(0) permanently for every scaled
+                -- player, doing an O(players) scan every single frame.
+                Wait(active and 0 or idlePoll)
+            end
+        end
+
+        ::continue::
     end
 end)
 
 local function beginDamageImpactStabilizer(victim)
-    local ped, scale = scaledLocalPed()
+    local ped = scaledLocalPed()
     if not ped or victim ~= ped or IsEntityDead(ped) then return end
 
     local cfg = (Config.Scale and Config.Scale.DamageImpactStabilizer) or {}
@@ -1105,24 +1213,24 @@ local function isFirearmDamageWeapon(weaponHash)
     return firearmGroups[group] == true
 end
 
-AddEventHandler('entityDamaged', function(victim, culprit, weapon, baseDamage)
+AddEventHandler('entityDamaged', function(victim, _culprit, weapon, _baseDamage)
     if not victim or victim == 0 then return end
 
-    -- v40: short-ped tackle launch protection. The bogus upward impulse could
-    -- make GTA apply fall/collision/unarmed damage when the tackle lands. During
-    -- the very short tackle physics window, restore only NON-FIREARM damage to
-    -- the local scaled ped. Firearm damage still behaves exactly as before.
-    local localPed, localScale = scaledLocalPed()
-    if localPed and victim == localPed and localScale < 0.999 and shortTacklePhysicsActive()
-        and not isFirearmDamageWeapon(weapon) then
-        if shortTackleProtectedHealth ~= nil then
-            local current = GetEntityHealth(localPed)
-            if current < shortTackleProtectedHealth then
-                SetEntityHealth(localPed, shortTackleProtectedHealth)
-            end
-        end
-        return
-    end
+    -- v45: the v40-v44 short-ped tackle "protection" is REMOVED.
+    --
+    -- It used to restore health whenever a ped scaled below 0.999 took any
+    -- NON-FIREARM damage inside a 900 ms window that re-armed whenever another
+    -- player stood within 2.35 m. Because "non-firearm" covered melee, thrown,
+    -- explosive, fire, vehicle and fall damage, that was an indefinitely
+    -- re-armable damage-immunity window: stand near anyone as a 0.87 ped and
+    -- melee, car rams and explosions were all refunded.
+    --
+    -- It was also a client raising its own health, which is the single most
+    -- commonly flagged anticheat pattern, and it made the medical resource see
+    -- negative damage.
+    --
+    -- The bogus upward impulse that motivated it is handled where it belongs:
+    -- by clamping VELOCITY in the tackle thread. Health is never rewritten.
 
     if not isFirearmDamageWeapon(weapon) then return end
     beginDamageImpactStabilizer(victim)
@@ -1272,8 +1380,13 @@ local function findVisualHitTarget(localPed)
             local targetServerId = GetPlayerServerId(player)
             local targetScale = effectiveScale(targetServerId)
 
+            -- v45: never target a downed / bleeding-out / dead player. Medical
+            -- resources keep those peds alive at a fixed health, so the old
+            -- IsEntityDead check inside shouldScalePed did not exclude them and
+            -- a downed player could be executed, skipping the EMS revive window.
             if not (Config.HitboxGuard.OnlyScaledTargets and isDefaultScale(targetScale))
-                and shouldScalePed(targetPed)
+                and not isPedDowned(targetPed, targetServerId)
+                and shouldScalePed(targetPed, targetServerId)
                 and #(GetEntityCoords(targetPed) - localCoords) <= maxDistance
                 and HasEntityClearLosToEntity(localPed, targetPed, 17)
             then
@@ -1344,20 +1457,26 @@ CreateThread(function()
                     lastShotAt = now
 
                     local weaponHash = GetSelectedPedWeapon(ped)
-                    local damage = chestDamageForWeapon(weaponHash)
+                    -- v45: IsPedShooting is also true for snowballs, balls,
+                    -- flare guns, petrol cans and fire extinguishers. Reject
+                    -- anything that is not a real firearm before reporting,
+                    -- so those can never register as a compensated hit.
+                    local damage = isFirearmDamageWeapon(weaponHash) and chestDamageForWeapon(weaponHash) or 0
                     if damage > 0 and damage <= (tonumber(Config.HitboxGuard.MaxDamage) or 250) then
                         local target = findVisualHitTarget(ped)
                         if target then
-                            if target.kind == 'head' and (Config.HitboxGuard.Head or {}).Enabled ~= false then
-                                -- Do not wait for native damage. A visual head hit is authoritative
-                                -- for scaled peds and must remain a one-tap kill.
-                                TriggerServerEvent('crimson-pedscale:server:visualHeadHit', target.serverId, weaponHash)
-                            else
-                                CreateThread(function()
-                                    Wait(tonumber(Config.HitboxGuard.NativeDamageDelayMs) or 175)
-                                    TriggerServerEvent('crimson-pedscale:server:visualChestHit', target.serverId, weaponHash)
-                                end)
-                            end
+                            local isHead = target.kind == 'head'
+                                and (Config.HitboxGuard.Head or {}).Enabled ~= false
+                            -- Both paths now wait for the native damage window so
+                            -- the victim can corroborate the shot locally. The head
+                            -- path used to skip this and command an instant kill.
+                            CreateThread(function()
+                                Wait(tonumber(Config.HitboxGuard.NativeDamageDelayMs) or 175)
+                                TriggerServerEvent(isHead
+                                    and 'crimson-pedscale:server:visualHeadHit'
+                                    or 'crimson-pedscale:server:visualChestHit',
+                                    target.serverId, weaponHash)
+                            end)
                         end
                     end
                 end
@@ -1366,33 +1485,76 @@ CreateThread(function()
     end
 end)
 
-RegisterNetEvent('crimson-pedscale:client:applyVisualHeadshot', function()
-    local ped = PlayerPedId()
-    if ped == 0 or IsEntityDead(ped) then return end
+-- ---------------------------------------------------------------------------
+-- v45 victim-side compensation.
+--
+-- Replaces applyVisualHeadshot + applyVisualChestDamage with ONE handler that
+-- can never kill and never fires on a shooter's word alone.
+--
+-- What changed and why:
+--  * The head path used to be SetEntityHealth(ped, 0) with no corroboration,
+--    no armour, no range check. Any player could drive it ~10x/second against
+--    any scaled player. It is gone.
+--  * Compensation now requires the victim's OWN client to have independently
+--    observed real native damage inside CorroborationWindowMs. An attacker who
+--    never actually shot produces no native damage here, so nothing applies.
+--  * Total compensation is capped per rolling window, and can never take the
+--    victim below MinHealthAfterCompensation. The killing blow must come from
+--    GTA's own damage so the medical resource sees a real death with a real
+--    killer instead of an unattributed self-death.
+-- ---------------------------------------------------------------------------
+local compensationWindowStart = 0
+local compensationInWindow = 0
 
-    -- One-tap means armor cannot soak the visual headshot. Setting health to 0
-    -- mirrors the city's existing one-shot-headshot rule even when GTA's native
-    -- capsule missed because the ped was matrix-scaled.
-    suppressDamageObservationUntil = GetGameTimer() + 250
-    SetEntityHealth(ped, 0)
-end)
+RegisterNetEvent('crimson-pedscale:client:applyVisualDamage', function(damage, _shooter, _weaponHash, isHeadshot)
+    if not Config.HitboxGuard.Enabled then return end
 
-RegisterNetEvent('crimson-pedscale:client:applyVisualChestDamage', function(damage)
+    local guard = Config.HitboxGuard
     damage = math.floor((tonumber(damage) or 0) + 0.5)
-    if damage <= 0 or damage > (tonumber(Config.HitboxGuard.MaxDamage) or 250) then return end
+    if damage <= 0 or damage > (tonumber(guard.MaxDamage) or 250) then return end
+
+    local ped = PlayerPedId()
+    if ped == 0 then return end
+
+    -- Never touch a downed, dying or dead player. Medical resources keep such
+    -- peds ALIVE at a non-zero health, so IsEntityDead alone is not enough:
+    -- without this a second report finished off a bleeding-out player and
+    -- skipped the entire EMS revive window.
+    if isPedDowned(ped, ownServerId()) then return end
 
     local now = GetGameTimer()
-    local nativeWindow = tonumber(Config.HitboxGuard.NativeDamageWindowMs) or 350
-    if now - lastNativeDamageAt <= nativeWindow then
-        return
+
+    -- Corroboration: only top up damage the engine actually delivered here.
+    if guard.RequireNativeCorroboration ~= false then
+        local window = tonumber(guard.CorroborationWindowMs) or 400
+        if lastNativeDamageAt <= 0 or (now - lastNativeDamageAt) > window then
+            return
+        end
     end
 
-    local ped = PlayerPedId()
-    if ped == 0 or IsEntityDead(ped) then return end
+    -- Rolling cap on how much compensation this client will accept.
+    local windowMs = tonumber(guard.CompensationWindowMs) or 1000
+    if (now - compensationWindowStart) > windowMs then
+        compensationWindowStart = now
+        compensationInWindow = 0
+    end
 
+    local allowance = math.max(0, (tonumber(guard.MaxCompensationPerWindow) or 60) - compensationInWindow)
+    if allowance <= 0 then return end
+    if damage > allowance then damage = allowance end
+
+    -- Never deal the killing blow.
+    local minHealth = math.max(0, tonumber(guard.MinHealthAfterCompensation) or 2)
+    local health = GetEntityHealth(ped)
+    local armor = GetPedArmour(ped)
+    local headroom = math.max(0, (health - minHealth) + armor)
+    if headroom <= 0 then return end
+    if damage > headroom then damage = headroom end
+    if damage <= 0 then return end
+
+    compensationInWindow = compensationInWindow + damage
     suppressDamageObservationUntil = now + 150
 
-    local armor = GetPedArmour(ped)
     local remaining = damage
     if armor > 0 then
         local absorbed = math.min(armor, remaining)
@@ -1401,10 +1563,74 @@ RegisterNetEvent('crimson-pedscale:client:applyVisualChestDamage', function(dama
     end
 
     if remaining > 0 then
-        local health = GetEntityHealth(ped)
-        SetEntityHealth(ped, math.max(0, health - remaining))
+        SetEntityHealth(ped, math.max(minHealth, health - remaining))
     end
 
     observedHealth = GetEntityHealth(ped)
     observedArmor = GetPedArmour(ped)
+
+    if Config.Debug then
+        print(('^3[crimson-pedscale]^0 compensation applied: %d (%s)')
+            :format(damage, isHeadshot and 'head' or 'chest'))
+    end
+end)
+
+
+-- ---------------------------------------------------------------------------
+-- v45 resource lifecycle cleanup.
+--
+-- The resource previously had NO onResourceStop handler. Two things leaked
+-- across a stop/restart:
+--
+--  * SetNuiFocus(true, true) was never released. Restarting the resource
+--    while a player had the menu open left them with input focus locked to a
+--    now-dead NUI frame -- effectively a frozen player who had to relog.
+--  * SetPedCanRagdoll(ped, false) from the damage-impact stabiliser could be
+--    latched. If the resource stopped inside that ~325 ms window the ped kept
+--    ragdoll disabled indefinitely, silently breaking every other resource's
+--    ragdoll (tackles, falls, medical takedowns).
+--
+-- Also restores every scaled ped's basis so no one is left visually scaled.
+-- ---------------------------------------------------------------------------
+AddEventHandler('onResourceStop', function(resourceName)
+    if resourceName ~= GetCurrentResourceName() then return end
+
+    -- Always release input focus, whatever state the menu was in.
+    SetNuiFocus(false, false)
+    uiOpen = false
+    previewScale = nil
+
+    -- Un-latch ragdoll on any ped we disabled it for.
+    if impactRagdollWasDisabled and impactStabilizePed ~= 0 and DoesEntityExist(impactStabilizePed) then
+        SetPedCanRagdoll(impactStabilizePed, true)
+    end
+    impactRagdollWasDisabled = false
+    impactStabilizePed = 0
+    impactStabilizeUntil = 0
+
+    local localPed = PlayerPedId()
+    if localPed ~= 0 and DoesEntityExist(localPed) then
+        SetPedCanRagdoll(localPed, true)
+    end
+
+    -- Restore every ped we were scaling back to a unit basis in place.
+    for _, player in ipairs(GetActivePlayers()) do
+        local serverId = GetPlayerServerId(player)
+        if lastApplied[serverId] then
+            local ped = GetPlayerPed(player)
+            clearMatrixScale(ped, serverId)
+            lastApplied[serverId] = nil
+        end
+    end
+
+    scaleState = {}
+    remoteAimState = {}
+    appliedGroundOffsets = {}
+    groundZCache = {}
+    traversalState = {}
+end)
+
+AddEventHandler('onResourceStart', function(resourceName)
+    if resourceName ~= GetCurrentResourceName() then return end
+    ReportPedScaleConfig('client')
 end)
