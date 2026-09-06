@@ -395,9 +395,17 @@ Config.HitboxGuard = {
     MaxCompensationPerWindow = 60,
     CompensationWindowMs = 1000,
 
-    -- Never let compensation reduce the victim below this health. Killing
-    -- blows must come from GTA's own damage so the medical resource sees a
-    -- real death with a real killer.
+    -- Never let compensation reduce the victim below
+    -- (PlayerDeathThreshold + MinHealthAfterCompensation). Killing blows must
+    -- come from GTA's own damage so the medical resource sees a real death
+    -- with a real killer.
+    --
+    -- PlayerDeathThreshold matters: a GTA V player ped is widely treated as
+    -- dead at 100, not 0 (health runs 100..200 for players, which is why
+    -- medical resources display health - 100). A bare floor of 2 was therefore
+    -- BELOW the death threshold and did not actually prevent a kill.
+    -- If your server uses a different model, adjust this.
+    PlayerDeathThreshold = 100,
     MinHealthAfterCompensation = 2,
 
     -- Require the shooter's ammo count to actually drop before a hit can be

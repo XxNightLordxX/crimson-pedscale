@@ -1452,6 +1452,12 @@ local function chestDamageForWeapon(weaponHash)
     local map = buildDamageMap()
     local configured = map[tonumber(weaponHash)]
     if configured ~= nil then return configured end
+
+    -- v45: keep this in step with the server copy. RejectUnknownWeapons was
+    -- initially only added server-side, so the client still fell back to
+    -- DefaultChestDamage for any unlisted hash and would report hits the
+    -- server then discarded.
+    if Config.HitboxGuard.RejectUnknownWeapons ~= false then return 0 end
     return tonumber(Config.HitboxGuard.DefaultChestDamage) or 0
 end
 
@@ -1752,7 +1758,11 @@ RegisterNetEvent('crimson-pedscale:client:applyVisualDamage', function(damage, _
     if damage > allowance then damage = allowance end
 
     -- Never deal the killing blow.
-    local minHealth = math.max(0, tonumber(guard.MinHealthAfterCompensation) or 2)
+    -- Floor is relative to the player death threshold, not zero: a GTA V player
+    -- ped dies at 100, so an absolute floor of 2 sat below it and still allowed
+    -- an unattributed kill.
+    local deathFloor = math.max(0, tonumber(guard.PlayerDeathThreshold) or 100)
+    local minHealth = deathFloor + math.max(0, tonumber(guard.MinHealthAfterCompensation) or 2)
     local health = GetEntityHealth(ped)
     local armor = GetPedArmour(ped)
     local headroom = math.max(0, (health - minHealth) + armor)
