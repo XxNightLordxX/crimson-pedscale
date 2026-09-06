@@ -990,20 +990,27 @@ end)
 --    de-duplication, so on a framework that emits more than one of them every
 --    character load ran the transition twice -- and each transition triggers a
 --    server broadcast to every player. Debounced below.
-local lastLifecycleAt = 0
+-- The debounce timestamps are PER EVENT KIND, deliberately.
+--
+-- A single shared timestamp looks tidier but is wrong: a character switch emits
+-- unload then load within a few hundred milliseconds, so the unload would eat
+-- the load and the newly selected character would never request its scale --
+-- silently leaving that character at 1.00.
+local lastUnloadAt = 0
+local lastLoadAt = 0
 local LIFECYCLE_DEBOUNCE_MS = 1000
 
 local function onCharacterUnload()
     local now = GetGameTimer()
-    if (now - lastLifecycleAt) < LIFECYCLE_DEBOUNCE_MS then return end
-    lastLifecycleAt = now
+    if lastUnloadAt > 0 and (now - lastUnloadAt) < LIFECYCLE_DEBOUNCE_MS then return end
+    lastUnloadAt = now
     beginCharacterTransition()
 end
 
 local function onCharacterLoaded()
     local now = GetGameTimer()
-    if (now - lastLifecycleAt) < LIFECYCLE_DEBOUNCE_MS then return end
-    lastLifecycleAt = now
+    if lastLoadAt > 0 and (now - lastLoadAt) < LIFECYCLE_DEBOUNCE_MS then return end
+    lastLoadAt = now
     beginCharacterTransition()
     requestCharacterScaleAfterLoad(500)
 end
@@ -1611,33 +1618,39 @@ CreateThread(function()
             Wait(0)
 
             local ped = PlayerPedId()
+
+            -- v45: IsPedShooting is a STATE, true for a whole automatic burst
+            -- and for a tail after each discrete shot. Gating on it plus a
+            -- fixed 115 ms timer decoupled compensation from rounds actually
+            -- fired: roughly 8.7 "free" hits/second, and on slow weapons more
+            -- compensations than bullets. Require real ammo consumption so at
+            -- most one compensation exists per round discharged.
+            --
+            -- The baseline is sampled EVERY tick, not only while shooting.
+            -- Sampling it inside the shooting branch meant the first round after
+            -- every weapon swap had no baseline and was silently dropped.
+            local firedRound = true
+            if ped ~= 0 and Config.HitboxGuard.RequireAmmoDecrease ~= false then
+                local weaponNow = GetSelectedPedWeapon(ped)
+                local okAmmo, ammo = pcall(GetAmmoInPedWeapon, ped, weaponNow)
+                if okAmmo and type(ammo) == 'number' then
+                    if lastSeenWeapon == weaponNow and lastSeenAmmo ~= nil then
+                        firedRound = ammo < lastSeenAmmo
+                    else
+                        firedRound = false      -- no baseline for this weapon yet
+                    end
+                    lastSeenAmmo = ammo
+                    lastSeenWeapon = weaponNow
+                else
+                    -- Native unavailable: fall back to the state-only behaviour
+                    -- rather than disabling the guard entirely.
+                    firedRound = true
+                end
+            end
+
             if ped ~= 0 and not IsEntityDead(ped) and IsPedShooting(ped) then
                 local now = GetGameTimer()
                 local cooldown = tonumber(Config.HitboxGuard.ShotCooldownMs) or 115
-
-                -- v45: IsPedShooting is a STATE, true for a whole automatic
-                -- burst and for a tail after each discrete shot. Gating on it
-                -- plus a fixed 115 ms timer decoupled compensation from rounds
-                -- actually fired: roughly 8.7 "free" hits/second, and on slow
-                -- weapons more compensations than bullets.
-                --
-                -- Require real ammo consumption, so at most one compensation
-                -- can exist per round discharged.
-                local firedRound = true
-                if Config.HitboxGuard.RequireAmmoDecrease ~= false then
-                    local weaponNow = GetSelectedPedWeapon(ped)
-                    local okAmmo, ammo = pcall(GetAmmoInPedWeapon, ped, weaponNow)
-                    if okAmmo and type(ammo) == 'number' then
-                        if lastSeenWeapon == weaponNow and lastSeenAmmo ~= nil then
-                            firedRound = ammo < lastSeenAmmo
-                        else
-                            -- First observation of this weapon: no baseline yet.
-                            firedRound = false
-                        end
-                        lastSeenAmmo = ammo
-                        lastSeenWeapon = weaponNow
-                    end
-                end
 
                 if firedRound and now - lastShotAt >= cooldown then
                     lastShotAt = now
