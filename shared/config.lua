@@ -36,6 +36,13 @@ Config.Permission = {
     Identifiers = {},
 
     -- Used when qb-core/qbx_core/es_extended are running and expose permissions.
+    --
+    -- NOTE for Qbox: exports.qbx_core:HasPermission is marked @deprecated
+    -- upstream and its body is just IsPlayerAceAllowed(source, permission),
+    -- i.e. it checks the BARE ace object ('admin'), not 'group.admin'. A stock
+    -- Qbox install grants no 'god' ace at all, so that entry is inert there.
+    -- The reliable path on Qbox is the ace check above:
+    --   add_ace group.admin crimson.pedscale allow
     QBCoreGroups = { 'admin', 'god' },
     ESXGroups = { 'admin', 'superadmin' }
 }
@@ -331,6 +338,38 @@ Config.HitboxGuard = {
         'GROUP_MG', 'GROUP_SHOTGUN', 'GROUP_SNIPER'
     },
 
+    -- Unconditional deny list, checked FIRST and independently of everything
+    -- else. Nothing here can ever produce compensated damage, whatever its
+    -- weapon group, whatever the damage table says, and even if
+    -- RejectUnknownWeapons is turned off.
+    --
+    -- Group membership alone is NOT enough to keep these out. GTA classifies
+    -- WEAPON_FLAREGUN as GROUP_PISTOL and WEAPON_FIREEXTINGUISHER /
+    -- WEAPON_PETROLCAN as GROUP_PETROLCAN, and IsPedShooting() is true for all
+    -- of them -- which is how a fire extinguisher was one-tapping scaled
+    -- players. This list is the belt to the group whitelist's braces.
+    NeverCompensate = {
+        'WEAPON_FIREEXTINGUISHER',
+        'WEAPON_PETROLCAN',
+        'WEAPON_FERTILIZERCAN',
+        'WEAPON_HAZARDCAN',
+        'WEAPON_FLAREGUN',
+        'WEAPON_FLARE',
+        'WEAPON_SNOWBALL',
+        'WEAPON_BALL',
+        'WEAPON_MOLOTOV',
+        'WEAPON_STUNGUN',
+        'WEAPON_STUNGUN_MP',
+        'WEAPON_FIREWORK',
+        'WEAPON_DIGISCANNER',
+        'WEAPON_GARBAGEBAG',
+        'WEAPON_HANDCUFFS',
+        'WEAPON_METALDETECTOR',
+        'WEAPON_BRIEFCASE',
+        'WEAPON_BRIEFCASE_02',
+        'WEAPON_UNARMED'
+    },
+
     -- Reject any weapon hash that is not explicitly listed in
     -- WeaponChestDamage. The old DefaultChestDamage fallback meant ANY
     -- unlisted or garbage hash was treated as 50 damage.
@@ -343,6 +382,14 @@ Config.HitboxGuard = {
     RequireNativeCorroboration = true,
     CorroborationWindowMs = 400,
 
+    -- How the victim decides it really was shot.
+    --   'firearm'   (default, correct) -- the entityDamaged game event fired for
+    --               this ped with a firearm weapon hash.
+    --   'anyDamage' (legacy, WEAKER)   -- also accepts a bare health drop, which
+    --               a medical bleed tick, a fall, fire or drowning all satisfy,
+    --               so a fabricated report can ride on unrelated damage.
+    CorroborationMode = 'firearm',
+
     -- Hard ceiling on compensation the victim will accept, regardless of
     -- what the server relays. Prevents burst-kills through any hole above.
     MaxCompensationPerWindow = 60,
@@ -352,6 +399,11 @@ Config.HitboxGuard = {
     -- blows must come from GTA's own damage so the medical resource sees a
     -- real death with a real killer.
     MinHealthAfterCompensation = 2,
+
+    -- Require the shooter's ammo count to actually drop before a hit can be
+    -- reported. IsPedShooting alone is a state that stays true for a whole
+    -- automatic burst, which decoupled compensation from rounds fired.
+    RequireAmmoDecrease = true,
 
     -- Server-side token bucket, per shooter, across ALL targets.
     RateLimit = {
@@ -383,6 +435,21 @@ Config.HitboxGuard = {
         UnknownRadius = 0.34
     },
 
+    -- KNOWN LIMITATIONS of the compensation model, documented rather than
+    -- silently shipped:
+    --
+    --  * The values below are a hard-coded table, not your server's
+    --    weapons.meta. They are roughly 2x vanilla and ignore any damage
+    --    modifiers you run, so they can shift TTK. MaxCompensationPerWindow
+    --    bounds the effect; tune these to your server if you enable the guard.
+    --  * The compensation ray starts at the gameplay CAMERA, not the weapon
+    --    muzzle, so hip-fire, recoil spread and third-person parallax are not
+    --    modelled. A shot that visually misses can still be scored a hit.
+    --  * The LOS check is ped-to-ped with trace flag 17, so vehicles and other
+    --    players do not block a compensated hit the way they block a bullet.
+    --  * At 0.87 a ped is already harder to hit natively; compensating on top
+    --    of that can over-correct. Consider enabling the guard only for scales
+    --    above 1.00 if your players report this.
     MaxDamage = 250,
 
     -- Fallback for weapons not listed in WeaponChestDamage. This is only

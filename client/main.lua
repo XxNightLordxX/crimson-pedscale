@@ -7,7 +7,17 @@ local previewScale = nil
 local ownSavedScale = Config.Scale.Default
 local damageByHash = nil
 local lastShotAt = 0
+-- v45: ammo baseline, so compensation is driven by rounds actually fired
+-- rather than by the IsPedShooting state.
+local lastSeenAmmo = nil
+local lastSeenWeapon = nil
 local lastNativeDamageAt = 0
+-- v45: a dedicated "I was actually shot by a firearm" signal, recorded from the
+-- entityDamaged game event (which carries the weapon hash). lastNativeDamageAt
+-- below is only "health went down for some reason", which a medical resource's
+-- bleed tick, a fall, fire or drowning all satisfy -- so it is far too weak to
+-- corroborate a hit report with.
+local lastFirearmDamageAt = 0
 local suppressDamageObservationUntil = 0
 local observedPed = 0
 local observedHealth = nil
@@ -205,8 +215,15 @@ local function isWalkableGroundNormal(normal, minNormalZ)
 end
 
 local function groundRay(ped, x, y, top, bottom, flags, minNormalZ, rootZ, minBelowRoot)
+    -- StartShapeTestRay is the alias for START_EXPENSIVE_SYNCHRONOUS_SHAPE_TEST_LOS_PROBE,
+    -- so reading the result in the same frame is correct -- it blocks. But the
+    -- STATUS was previously discarded: only status 2 means "complete, result
+    -- valid". Anything else was being read as a real miss.
     local ray = StartShapeTestRay(x, y, top, x, y, bottom, flags, ped, 0)
-    local _, hit, hitPos, surfaceNormal = GetShapeTestResult(ray)
+    local status, hit, hitPos, surfaceNormal = GetShapeTestResult(ray)
+    if status ~= 2 then return nil end
+    -- `hit` is a BOOL* out-param, which marshals to an integer here, so compare
+    -- against 1 rather than treating it as a boolean.
     if hit == 1 and hitPos and isWalkableGroundNormal(surfaceNormal, minNormalZ) then
         -- v27: A valid floor must be BELOW the ped's entity/root origin.
         -- The old ray began 2m above the root, so MLO ceilings/doorway geometry
@@ -412,9 +429,56 @@ local function setScaledMatrixAtZ(ped, scale, forward, right, up, position, z)
     )
 end
 
+-- v45 teleport / streaming discontinuity guard.
+--
+-- desiredRootZ falls back to groundZCache[serverId] -- an ABSOLUTE world Z
+-- cached from wherever the ped last stood -- whenever every ground probe fails.
+-- Nothing invalidated that on a teleport, so a player warped by an admin, a
+-- respawn, an interior load or a medical resource's revive was re-anchored to
+-- the floor height of their PREVIOUS location until a probe succeeded again.
+--
+-- Detect the discontinuity and drop the stale state instead. Also skip
+-- correction entirely until collision has streamed in around the ped, since
+-- every probe fails against unloaded geometry.
+local TELEPORT_DISCONTINUITY_M = 5.0
+
+local function groundStateIsStale(serverId, position)
+    if not serverId then return false end
+    local cached = appliedGroundOffsets[serverId]
+    if not cached or not cached.x then return false end
+
+    local dx = position.x - cached.x
+    local dy = position.y - cached.y
+    return ((dx * dx) + (dy * dy)) > (TELEPORT_DISCONTINUITY_M * TELEPORT_DISCONTINUITY_M)
+end
+
+local function dropGroundState(serverId, ped)
+    if serverId then
+        appliedGroundOffsets[serverId] = nil
+        groundZCache[serverId] = nil
+        traversalState[serverId] = nil
+    end
+    if ped then groundRayCache[ped] = nil end
+end
+
 local function applyMatrixScale(ped, scale, serverId)
     local forward, right, up, position = GetEntityMatrix(ped)
     if not forward or not right or not up or not position then return end
+
+    -- A teleport invalidates every cached ground reference. Skip this frame so
+    -- the next one re-probes cleanly at the new location.
+    if groundStateIsStale(serverId, position) then
+        dropGroundState(serverId, ped)
+        return
+    end
+
+    -- Probing against geometry that has not streamed in yet just produces
+    -- misses, which then feed the stale-cache fallback.
+    local collisionOk, collisionLoaded = pcall(HasCollisionLoadedAroundEntity, ped)
+    if collisionOk and collisionLoaded == false then
+        dropGroundState(serverId, ped)
+        return
+    end
 
     forward = normalizeVector(forward)
     right = normalizeVector(right)
@@ -610,6 +674,9 @@ local function applyMatrixScale(ped, scale, serverId)
             appliedGroundOffsets[serverId] = {
                 ped = ped,
                 rootZ = appliedZ,
+                -- x/y let the next frame detect a teleport and drop stale state.
+                x = position.x,
+                y = position.y,
                 remoteTraversalOffset = cached and cached.remoteTraversalOffset or nil,
                 remoteRegrounding = cached and cached.remoteRegrounding or nil
             }
@@ -699,6 +766,9 @@ local function applyMatrixScale(ped, scale, serverId)
         appliedGroundOffsets[serverId] = {
             ped = ped,
             rootZ = appliedZ,
+            -- x/y let the next frame detect a teleport and drop stale state.
+            x = position.x,
+            y = position.y,
             -- Preserve v22's short-lived doorway candidate across frames.
             pendingDoorwayZ = cached and cached.pendingDoorwayZ or nil,
             pendingDoorwaySince = cached and cached.pendingDoorwaySince or nil
@@ -821,12 +891,31 @@ RegisterNetEvent('crimson-pedscale:client:removeScale', function(serverId)
     downedStateCache[serverId] = nil
 end)
 
+-- v45: SetNuiFocus is a single process-wide input flag with no owner tracking.
+-- This menu is pushed from the SERVER, so an admin running /givepedscale on a
+-- player who is mid-X-ray, mid-MRI or in any other resource's NUI would steal
+-- focus from it, and whichever menu closed first would call SetNuiFocus(false)
+-- and strand the other.
+--
+-- Refuse to open if something else already holds focus, and only ever release
+-- focus that we took ourselves.
+local nuiFocusHeldByUs = false
+
 RegisterNetEvent('crimson-pedscale:client:openMenu', function(payload)
     payload = payload or {}
+
+    local busyOk, busy = pcall(IsNuiFocused)
+    if not uiOpen and busyOk and busy then
+        notify(('%s: close your other menu first, then try again.')
+            :format(Config.Notifications.Prefix or 'Crimson Ped Scale'))
+        return
+    end
+
     uiOpen = true
     previewScale = clampScale(payload.scale or ownSavedScale)
 
     SetNuiFocus(true, true)
+    nuiFocusHeldByUs = true
     SendNUIMessage({
         action = 'open',
         scale = previewScale,
@@ -842,7 +931,11 @@ local function closeMenu(revertPreview)
     if revertPreview then
         previewScale = nil
     end
-    SetNuiFocus(false, false)
+    -- Only drop focus if we are the ones holding it.
+    if nuiFocusHeldByUs then
+        SetNuiFocus(false, false)
+        nuiFocusHeldByUs = false
+    end
     SendNUIMessage({ action = 'close' })
 end
 
@@ -884,25 +977,46 @@ CreateThread(function()
     requestCharacterScaleAfterLoad(750)
 end)
 
--- Qbox/QBCore character lifecycle. We listen to both compatibility names so
--- this survives framework updates and multicharacter resources that reuse them.
-RegisterNetEvent('QBCore:Client:OnPlayerUnload', function()
-    beginCharacterTransition()
-end)
+-- Qbox/QBCore character lifecycle.
+--
+-- v45 fixes two problems here:
+--
+--  * `qbx_core:client:onPlayerUnload` and `qbx_core:client:onPlayerLoaded` do
+--    not exist. qbx_core never fires either string, so both handlers were dead.
+--    The events Qbox actually publishes are the QBCore compat names (already
+--    handled) plus `qbx_core:client:playerLoggedOut`.
+--
+--  * The compat names were registered with byte-identical bodies and no
+--    de-duplication, so on a framework that emits more than one of them every
+--    character load ran the transition twice -- and each transition triggers a
+--    server broadcast to every player. Debounced below.
+local lastLifecycleAt = 0
+local LIFECYCLE_DEBOUNCE_MS = 1000
 
-RegisterNetEvent('qbx_core:client:onPlayerUnload', function()
+local function onCharacterUnload()
+    local now = GetGameTimer()
+    if (now - lastLifecycleAt) < LIFECYCLE_DEBOUNCE_MS then return end
+    lastLifecycleAt = now
     beginCharacterTransition()
-end)
+end
 
-RegisterNetEvent('QBCore:Client:OnPlayerLoaded', function()
+local function onCharacterLoaded()
+    local now = GetGameTimer()
+    if (now - lastLifecycleAt) < LIFECYCLE_DEBOUNCE_MS then return end
+    lastLifecycleAt = now
     beginCharacterTransition()
     requestCharacterScaleAfterLoad(500)
-end)
+end
 
-RegisterNetEvent('qbx_core:client:onPlayerLoaded', function()
-    beginCharacterTransition()
-    requestCharacterScaleAfterLoad(500)
-end)
+-- qbx_core raises OnPlayerLoaded with a local TriggerEvent, so AddEventHandler
+-- is the correct registration for it; RegisterNetEvent covers the server-sent
+-- QBCore compat path.
+RegisterNetEvent('QBCore:Client:OnPlayerUnload', onCharacterUnload)
+AddEventHandler('QBCore:Client:OnPlayerUnload', onCharacterUnload)
+RegisterNetEvent('qbx_core:client:playerLoggedOut', onCharacterUnload)
+
+RegisterNetEvent('QBCore:Client:OnPlayerLoaded', onCharacterLoaded)
+AddEventHandler('QBCore:Client:OnPlayerLoaded', onCharacterLoaded)
 
 AddEventHandler('playerSpawned', function()
     -- playerSpawned can fire during normal respawns too. Requesting is safe: the
@@ -1229,9 +1343,24 @@ local firearmGroups = {
     [GetHashKey('GROUP_SNIPER')] = true
 }
 
+-- v45 unconditional deny list, mirroring the server's. Checked before the
+-- group test because group membership is not sufficient: GTA classifies
+-- WEAPON_FLAREGUN as GROUP_PISTOL, and IsPedShooting() is true while a player
+-- sprays a fire extinguisher or petrol can. Those must never be treated as
+-- gunshots by any part of this resource.
+local deniedCompensationWeapons = {}
+for _, weaponName in ipairs((Config.HitboxGuard or {}).NeverCompensate or {}) do
+    deniedCompensationWeapons[GetHashKey(weaponName)] = true
+end
+
+local function isDeniedCompensationWeapon(weaponHash)
+    return deniedCompensationWeapons[tonumber(weaponHash) or 0] == true
+end
+
 local function isFirearmDamageWeapon(weaponHash)
     weaponHash = tonumber(weaponHash) or 0
     if weaponHash == 0 then return false end
+    if isDeniedCompensationWeapon(weaponHash) then return false end
 
     local group = GetWeapontypeGroup(weaponHash)
     return firearmGroups[group] == true
@@ -1257,6 +1386,14 @@ AddEventHandler('entityDamaged', function(victim, _culprit, weapon, _baseDamage)
     -- by clamping VELOCITY in the tackle thread. Health is never rewritten.
 
     if not isFirearmDamageWeapon(weapon) then return end
+
+    -- Record the precise corroboration signal: this client's own ped was hit by
+    -- a real firearm, according to the engine. Only this authorises the hitbox
+    -- guard to apply compensation.
+    if victim == PlayerPedId() then
+        lastFirearmDamageAt = GetGameTimer()
+    end
+
     beginDamageImpactStabilizer(victim)
 end)
 
@@ -1477,7 +1614,32 @@ CreateThread(function()
             if ped ~= 0 and not IsEntityDead(ped) and IsPedShooting(ped) then
                 local now = GetGameTimer()
                 local cooldown = tonumber(Config.HitboxGuard.ShotCooldownMs) or 115
-                if now - lastShotAt >= cooldown then
+
+                -- v45: IsPedShooting is a STATE, true for a whole automatic
+                -- burst and for a tail after each discrete shot. Gating on it
+                -- plus a fixed 115 ms timer decoupled compensation from rounds
+                -- actually fired: roughly 8.7 "free" hits/second, and on slow
+                -- weapons more compensations than bullets.
+                --
+                -- Require real ammo consumption, so at most one compensation
+                -- can exist per round discharged.
+                local firedRound = true
+                if Config.HitboxGuard.RequireAmmoDecrease ~= false then
+                    local weaponNow = GetSelectedPedWeapon(ped)
+                    local okAmmo, ammo = pcall(GetAmmoInPedWeapon, ped, weaponNow)
+                    if okAmmo and type(ammo) == 'number' then
+                        if lastSeenWeapon == weaponNow and lastSeenAmmo ~= nil then
+                            firedRound = ammo < lastSeenAmmo
+                        else
+                            -- First observation of this weapon: no baseline yet.
+                            firedRound = false
+                        end
+                        lastSeenAmmo = ammo
+                        lastSeenWeapon = weaponNow
+                    end
+                end
+
+                if firedRound and now - lastShotAt >= cooldown then
                     lastShotAt = now
 
                     local weaponHash = GetSelectedPedWeapon(ped)
@@ -1549,9 +1711,18 @@ RegisterNetEvent('crimson-pedscale:client:applyVisualDamage', function(damage, _
     local now = GetGameTimer()
 
     -- Corroboration: only top up damage the engine actually delivered here.
+    --
+    -- This uses lastFirearmDamageAt (the entityDamaged game event, which carries
+    -- the weapon hash), NOT a bare health drop. A medical resource's bleed tick,
+    -- a fall, fire or drowning all lower health, and accepting those would let a
+    -- fabricated report land whenever the victim happened to be taking any
+    -- damage at all.
     if guard.RequireNativeCorroboration ~= false then
         local window = tonumber(guard.CorroborationWindowMs) or 400
-        if lastNativeDamageAt <= 0 or (now - lastNativeDamageAt) > window then
+        local signal = (guard.CorroborationMode == 'anyDamage')
+            and math.max(lastFirearmDamageAt, lastNativeDamageAt)
+            or lastFirearmDamageAt
+        if signal <= 0 or (now - signal) > window then
             return
         end
     end
@@ -1619,8 +1790,11 @@ end)
 AddEventHandler('onResourceStop', function(resourceName)
     if resourceName ~= GetCurrentResourceName() then return end
 
-    -- Always release input focus, whatever state the menu was in.
+    -- Always release input focus, whatever state the menu was in. A stopping
+    -- resource cannot leave a player stuck with focus latched to a dead frame,
+    -- so this one release is unconditional.
     SetNuiFocus(false, false)
+    nuiFocusHeldByUs = false
     uiOpen = false
     previewScale = nil
 

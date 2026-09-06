@@ -86,6 +86,7 @@ local buildWeaponDamage
 -- is also true for snowballs, balls, flare guns, petrol cans and fire
 -- extinguishers, all of which previously one-tapped a scaled target.
 local allowedWeaponGroups = nil
+local deniedWeapons = nil
 local weaponGroupNativeUsable = nil
 
 local function isAllowedWeapon(weaponHash)
@@ -96,8 +97,20 @@ local function isAllowedWeapon(weaponHash)
         end
     end
 
+    if not deniedWeapons then
+        deniedWeapons = {}
+        for _, weaponName in ipairs((Config.HitboxGuard or {}).NeverCompensate or {}) do
+            deniedWeapons[GetHashKey(weaponName)] = true
+        end
+    end
+
     weaponHash = tonumber(weaponHash) or 0
     if weaponHash == 0 then return false end
+
+    -- Unconditional deny list first. GTA puts WEAPON_FLAREGUN in GROUP_PISTOL,
+    -- so the group whitelist alone would let it through; fire extinguishers and
+    -- petrol cans reach here because IsPedShooting() is true while spraying.
+    if deniedWeapons[weaponHash] then return false end
 
     -- GetWeapontypeGroup is not guaranteed to exist on every server build.
     -- Probe it once. If it is unusable, fall back to the explicit

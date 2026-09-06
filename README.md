@@ -42,19 +42,45 @@ damage and the killer is attributed normally.
 
 ### 2. Victim-side corroboration
 
-The victim's own client must have independently observed real native damage
-within `CorroborationWindowMs` before applying anything. An attacker who never
-actually fired produces no native damage on the victim, so nothing applies.
+The victim's own client must have independently observed a real **firearm
+damage event** within `CorroborationWindowMs` before applying anything. An
+attacker who never actually fired produces no such event on the victim, so
+nothing applies.
 
 This is the load-bearing defence. The server-side checks bound the abuse rate;
 this is what makes fabricated reports inert.
+
+Corroboration keys on the `entityDamaged` game event (which carries the weapon
+hash), **not** on a bare health drop. A medical resource's bleed tick, a fall,
+fire or drowning all lower health, and accepting those would let a fabricated
+report land whenever the victim happened to be taking any damage at all.
 
 ### 3. Non-firearms rejected
 
 `IsPedShooting` is true for snowballs, balls, flare guns, petrol cans and fire
 extinguishers. Combined with the `DefaultChestDamage` fallback, all of them
-one-tapped a scaled target. Weapons are now validated against
-`AllowedWeaponGroups` **and** must be explicitly listed in `WeaponChestDamage`.
+one-tapped a scaled target.
+
+Three independent layers now block this, on both client and server:
+
+1. **`NeverCompensate`** — an unconditional deny list, checked first. Nothing on
+   it can ever compensate, whatever its group, whatever the damage table says,
+   even with `RejectUnknownWeapons` turned off.
+2. **`AllowedWeaponGroups`** — must be a real firearm group.
+3. **`RejectUnknownWeapons`** — must be explicitly listed in `WeaponChestDamage`.
+
+The deny list is not redundant. GTA classifies `WEAPON_FLAREGUN` as
+`GROUP_PISTOL`, so a group whitelist alone lets it through. This is verified by
+a test that runs under the weakest config a server owner could plausibly set,
+and which also checks real firearms still work so the guard is not over-blocking.
+
+### 3b. Compensation is tied to rounds actually fired
+
+`IsPedShooting` is a *state* — true for a whole automatic burst and for a tail
+after each shot. Gating on it plus a 115 ms timer gave roughly 8.7 "free"
+compensations per second, and on slow weapons more compensations than bullets.
+It now requires the shooter's ammo count to actually drop
+(`RequireAmmoDecrease`), so at most one compensation exists per round.
 
 ### 4. Damage-immunity window removed
 
@@ -110,6 +136,23 @@ that bounds a shooter's total rate across every target.
   anchor rather than the ped's current Z — and it runs exactly when a ped stops
   qualifying (died, entered a vehicle, got attached to a stretcher, was frozen).
   It now restores the unit basis in place and skips attached/frozen peds.
+* **Stale ground cache on teleport.** When every ground probe failed,
+  `desiredRootZ` fell back to an absolute world Z cached from wherever the ped
+  last stood — so an admin teleport, a respawn, an interior load or a medical
+  revive re-anchored the player to their *previous* location's floor height.
+  Teleports are now detected and the cached state dropped, and correction is
+  skipped until collision has streamed in.
+* **Shape-test status discarded.** `GetShapeTestResult`'s status was ignored, so
+  an incomplete probe read as a genuine miss and fed the stale-cache fallback.
+* **Dead Qbox lifecycle handlers.** `qbx_core:client:onPlayerLoaded` and
+  `:onPlayerUnload` do not exist — qbx_core never fires either string. Replaced
+  with `qbx_core:client:playerLoggedOut` plus the QBCore compat names, and the
+  handlers are now debounced so a framework emitting more than one name does not
+  run the transition (and its server-wide broadcast) twice per character load.
+* **NUI focus theft.** `SetNuiFocus` is a single process-wide flag. This menu is
+  pushed from the server, so `/givepedscale` on a player mid-X-ray or mid-MRI
+  stole focus, and whichever menu closed first stranded the other. It now
+  refuses to open over an existing NUI and only releases focus it took itself.
 * **Unbounded tables.** `groundZCache` and `remoteAimState` were never pruned.
   `lastVisualHit` freed a leaving player's own row but left them as a *target*
   in every other shooter's row.
