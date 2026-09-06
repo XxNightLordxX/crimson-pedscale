@@ -16,9 +16,25 @@ local function scaleDefaults()
     return default, minScale, maxScale
 end
 
+local function isFiniteNumber(value)
+    -- NaN is the trap: IEEE-754 makes every comparison against NaN false, so
+    -- `value < min` and `value > max` BOTH fail and a NaN passes through a
+    -- min/max clamp completely untouched. `value ~= value` is the NaN test.
+    return type(value) == 'number'
+        and value == value
+        and value ~= math.huge
+        and value ~= -math.huge
+end
+
 local function clampScale(scale)
     local default, minScale, maxScale = scaleDefaults()
-    local value = tonumber(scale) or default
+    local value = tonumber(scale)
+    -- v45: reject non-finite input before clamping. Previously a NaN sent by a
+    -- modified client survived clampScale intact, was stored to KVP as "-nan",
+    -- and was broadcast to every player. Each receiving client then fed nine
+    -- NaN basis components and a NaN world Z into SetEntityMatrix once per
+    -- frame -- an invalid transform on a networked entity.
+    if not isFiniteNumber(value) then value = default end
     if value < minScale then value = minScale end
     if value > maxScale then value = maxScale end
     return math.floor((value * 100.0) + 0.5) / 100.0
@@ -26,7 +42,12 @@ end
 
 local function isDefaultScale(scale)
     local default = scaleDefaults()
-    return math.abs((tonumber(scale) or default) - default) < 0.001
+    local value = tonumber(scale)
+    -- A non-finite value is not "the default", but it must never be treated as
+    -- a legitimate custom scale either: math.abs(nan - 1.0) < 0.001 is false,
+    -- which is how a NaN previously got published as a real scale.
+    if not isFiniteNumber(value) then return true end
+    return math.abs(value - default) < 0.001
 end
 
 -- ---------------------------------------------------------------------------
@@ -448,18 +469,23 @@ local function applyMatrixScale(ped, scale, serverId)
     local forward, right, up, position = GetEntityMatrix(ped)
     if not forward or not right or not up or not position then return end
 
-    -- A teleport invalidates every cached ground reference. Skip this frame so
-    -- the next one re-probes cleanly at the new location.
-    if groundStateIsStale(serverId, position) then
-        dropGroundState(serverId, ped)
-        return
-    end
-
-    -- Probing against geometry that has not streamed in yet just produces
-    -- misses, which then feed the stale-cache fallback.
+    -- A teleport invalidates every cached ground reference, and probing against
+    -- geometry that has not streamed in yet only produces misses that feed the
+    -- stale-cache fallback. In both cases drop the cached state and let GTA own
+    -- root Z for this frame.
+    --
+    -- Note these RELEASE root-Z rather than skipping the frame: returning early
+    -- would leave the ped rendering at its native 1.00 basis for those frames,
+    -- which reads as a visible scale pop on every teleport, respawn and
+    -- interior load. Every other branch in this function preserves the scaled
+    -- basis and varies only the Z it is applied at; these now match.
     local collisionOk, collisionLoaded = pcall(HasCollisionLoadedAroundEntity, ped)
-    if collisionOk and collisionLoaded == false then
+    local streamingIn = collisionOk and collisionLoaded == false
+
+    if groundStateIsStale(serverId, position) or streamingIn then
         dropGroundState(serverId, ped)
+        setScaledMatrixAtZ(ped, scale, normalizeVector(forward), normalizeVector(right),
+            normalizeVector(up), position, position.z)
         return
     end
 
@@ -781,14 +807,16 @@ local function clearMatrixScale(ped, serverId)
         return
     end
 
-    if not IsEntityAttached(ped) and not IsEntityPositionFrozen(ped) then
-        local forward, right, up, position = GetEntityMatrix(ped)
-        if forward and right and up and position then
-            forward = normalizeVector(forward)
-            right = normalizeVector(right)
-            up = normalizeVector(up)
-            setScaledMatrixAtZ(ped, Config.Scale.Default, forward, right, up, position, position.z)
-        end
+    -- Writing the unit basis AT THE PED'S CURRENT POSITION is safe even for an
+    -- attached or frozen ped: it changes only the basis, never the translation.
+    -- Skipping them (as an earlier v45 draft did) left a frozen ped whose scale
+    -- was removed rendering at the old scale indefinitely.
+    local forward, right, up, position = GetEntityMatrix(ped)
+    if forward and right and up and position then
+        forward = normalizeVector(forward)
+        right = normalizeVector(right)
+        up = normalizeVector(up)
+        setScaledMatrixAtZ(ped, Config.Scale.Default, forward, right, up, position, position.z)
     end
 
     if serverId then
@@ -817,9 +845,12 @@ end
 
 local function setScaleState(serverId, scale)
     serverId = tonumber(serverId)
-    if not serverId then return end
+    if not serverId or not isFiniteNumber(serverId) then return end
 
+    -- clampScale already rejects non-finite input; this is a second gate so no
+    -- value from any source can reach SetEntityMatrix unvalidated.
     local normalized = clampScale(scale)
+    if not isFiniteNumber(normalized) then return end
     if isDefaultScale(normalized) then
         scaleState[serverId] = nil
     else
@@ -891,6 +922,10 @@ RegisterNetEvent('crimson-pedscale:client:openMenu', function(payload)
     if not uiOpen and busyOk and busy then
         notify(('%s: close your other menu first, then try again.')
             :format(Config.Notifications.Prefix or 'Crimson Ped Scale'))
+        -- Tell the server the menu did NOT open, so it can release the grant and
+        -- report the real outcome. Without this the opener is told the menu was
+        -- opened for a player who never saw it, and a 120s grant sits unused.
+        TriggerServerEvent('crimson-pedscale:server:menuDeclined')
         return
     end
 

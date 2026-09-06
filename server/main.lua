@@ -74,9 +74,25 @@ local function scaleDefaults()
     return default, minScale, maxScale
 end
 
+local function isFiniteNumber(value)
+    -- NaN is the trap: IEEE-754 makes every comparison against NaN false, so
+    -- `value < min` and `value > max` BOTH fail and a NaN passes through a
+    -- min/max clamp completely untouched. `value ~= value` is the NaN test.
+    return type(value) == 'number'
+        and value == value
+        and value ~= math.huge
+        and value ~= -math.huge
+end
+
 local function clampScale(scale)
     local default, minScale, maxScale = scaleDefaults()
-    local value = tonumber(scale) or default
+    local value = tonumber(scale)
+    -- v45: reject non-finite input before clamping. Previously a NaN sent by a
+    -- modified client survived clampScale intact, was stored to KVP as "-nan",
+    -- and was broadcast to every player. Each receiving client then fed nine
+    -- NaN basis components and a NaN world Z into SetEntityMatrix once per
+    -- frame -- an invalid transform on a networked entity.
+    if not isFiniteNumber(value) then value = default end
     if value < minScale then value = minScale end
     if value > maxScale then value = maxScale end
     return math.floor((value * 100.0) + 0.5) / 100.0
@@ -84,7 +100,12 @@ end
 
 local function isDefaultScale(scale)
     local default = scaleDefaults()
-    return math.abs((tonumber(scale) or default) - default) < 0.001
+    local value = tonumber(scale)
+    -- A non-finite value is not "the default", but it must never be treated as
+    -- a legitimate custom scale either: math.abs(nan - 1.0) < 0.001 is false,
+    -- which is how a NaN previously got published as a real scale.
+    if not isFiniteNumber(value) then return true end
+    return math.abs(value - default) < 0.001
 end
 
 -- v45: findIdentifier/primaryIdentifier removed. Persistence keys on the
@@ -274,17 +295,22 @@ end
 
 RegisterNetEvent('crimson-pedscale:server:requestData', function()
     local src = source
-    if not rateLimit(src, 'requestData') then return end
     local citizenid = characterIdentifier(src)
 
-    -- Character swaps reuse the same server ID. Clear the previous character's
-    -- live scale before loading anything for the newly selected character.
+    -- Check readiness BEFORE spending the rate-limit slot. When character data
+    -- is not ready the client is expected to retry; consuming the slot here
+    -- would reject that retry and leave the player at the default scale.
     if not citizenid then
         local default = scaleDefaults()
         publishScale(src, default)
         TriggerClientEvent('crimson-pedscale:client:fullSync', src, publicScales(), default)
         return
     end
+
+    if not rateLimit(src, 'requestData') then return end
+
+    -- Character swaps reuse the same server ID; the not-ready branch above has
+    -- already cleared the previous character's live scale.
 
     local savedScale = loadPlayerScale(src)
     publishScale(src, savedScale)
@@ -299,6 +325,21 @@ RegisterNetEvent('crimson-pedscale:server:characterTransition', function()
     if not rateLimit(src, 'characterTransition') then return end
     publishScale(src, scaleDefaults())
     menuGrants[src] = nil
+end)
+
+-- The client could not open the menu because another resource already holds
+-- NUI focus. Release the grant so it is not left dangling, and tell whoever
+-- opened it what actually happened.
+RegisterNetEvent('crimson-pedscale:server:menuDeclined', function()
+    local src = source
+    if not rateLimit(src, 'menuDeclined') then return end
+
+    local grant = menuGrants[src]
+    menuGrants[src] = nil
+    if grant and grant.opener and grant.opener ~= src and GetPlayerName(grant.opener) then
+        notify(grant.opener,
+            ('ID %s is in another menu; the scale menu did not open.'):format(src), 'error')
+    end
 end)
 
 RegisterNetEvent('crimson-pedscale:server:saveScale', function(scale)

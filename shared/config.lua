@@ -272,11 +272,16 @@ Config.Compat = {
 Config.Limits = {
     Enabled = true,
     -- Minimum milliseconds between accepted calls, per player, per event.
+    -- requestData RESTORES a scale; characterTransition CLEARS it. The restore
+    -- cooldown must be strictly shorter than the clear cooldown, otherwise a
+    -- character switch inside the gap clears the scale and then has its restore
+    -- rejected, leaving the player stuck at 1.00 until the next trigger.
     PerEventCooldownMs = {
-        requestData = 2000,
+        requestData = 1000,
         characterTransition = 1500,
         saveScale = 750,
-        resetScale = 750
+        resetScale = 750,
+        menuDeclined = 1000
     },
     DefaultCooldownMs = 500,
 
@@ -371,6 +376,8 @@ function ValidatePedScaleConfig()
     return problems
 end
 
+-- Re-runs validation (idempotent -- the values are already clamped) purely to
+-- collect the human-readable warnings for printing.
 function ReportPedScaleConfig(sideLabel)
     local problems = ValidatePedScaleConfig()
     if #problems == 0 then return end
@@ -379,3 +386,14 @@ function ReportPedScaleConfig(sideLabel)
         print(('^3[crimson-pedscale]^0   %d. %s'):format(i, problems[i]))
     end
 end
+
+-- Run validation HERE, at the bottom of the shared config, rather than from an
+-- onResourceStart handler. config.lua is a shared_script and loads before
+-- client/main.lua and server/main.lua, so this guarantees the clamped values
+-- are in place before any consumer's top-level code reads them -- including
+-- RegisterCommand, which previously executed with the raw, unvalidated command
+-- names that validation claimed to protect.
+--
+-- ReportPedScaleConfig is still called from onResourceStart on each side so the
+-- warnings are printed once per environment with a client/server label.
+ValidatePedScaleConfig()
