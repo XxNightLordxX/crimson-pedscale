@@ -298,203 +298,32 @@ Config.Notifications = {
     UseChat = true
 }
 
-Config.HitboxGuard = {
-    -- Entity-matrix scaling changes the visual body more than GTA's native
-    -- damage capsule. This guard compensates chest shots that visually land.
-    --
-    -- ############################################################### --
-    -- ##  READ THIS BEFORE SETTING Enabled = true                  ## --
-    -- ############################################################### --
-    --
-    -- This guard is CLIENT-AUTHORITATIVE by design: the shooter's client
-    -- decides it landed a hit, and the victim's client then damages itself.
-    -- FiveM gives the server no way to verify that a shot happened, so a
-    -- modified client can report hits it never fired.
-    --
-    -- v45 removes the instant-kill primitive and adds firearm whitelisting,
-    -- token-bucket rate limiting, damage caps and victim-side corroboration.
-    -- Those bound the abuse; they do not eliminate it. A determined cheater
-    -- can still convert this into a capped damage advantage.
-    --
-    -- It therefore ships DISABLED. Turn it on only if you accept that
-    -- trade-off, and read the "Hitbox guard" section of the README first.
-    Enabled = false,
-    OnlyScaledTargets = true,
-
-    RayDistance = 220.0,
-    CandidateDistance = 200.0,
-    ShotCooldownMs = 115,
-    NativeDamageDelayMs = 175,
-    NativeDamageWindowMs = 350,
-    ServerCooldownMs = 95,
-
-    -- v45 hardening ------------------------------------------------------
-    -- Only weapons whose GetWeapontypeGroup is in this set may ever produce
-    -- a compensated hit. This is what stops snowballs, balls, flare guns,
-    -- petrol cans and fire extinguishers from being accepted as gunshots
-    -- (IsPedShooting is true for all of them).
-    AllowedWeaponGroups = {
-        'GROUP_PISTOL', 'GROUP_SMG', 'GROUP_RIFLE',
-        'GROUP_MG', 'GROUP_SHOTGUN', 'GROUP_SNIPER'
-    },
-
-    -- Unconditional deny list, checked FIRST and independently of everything
-    -- else. Nothing here can ever produce compensated damage, whatever its
-    -- weapon group, whatever the damage table says, and even if
-    -- RejectUnknownWeapons is turned off.
-    --
-    -- Group membership alone is NOT enough to keep these out. GTA classifies
-    -- WEAPON_FLAREGUN as GROUP_PISTOL and WEAPON_FIREEXTINGUISHER /
-    -- WEAPON_PETROLCAN as GROUP_PETROLCAN, and IsPedShooting() is true for all
-    -- of them -- which is how a fire extinguisher was one-tapping scaled
-    -- players. This list is the belt to the group whitelist's braces.
-    NeverCompensate = {
-        'WEAPON_FIREEXTINGUISHER',
-        'WEAPON_PETROLCAN',
-        'WEAPON_FERTILIZERCAN',
-        'WEAPON_HAZARDCAN',
-        'WEAPON_FLAREGUN',
-        'WEAPON_FLARE',
-        'WEAPON_SNOWBALL',
-        'WEAPON_BALL',
-        'WEAPON_MOLOTOV',
-        'WEAPON_STUNGUN',
-        'WEAPON_STUNGUN_MP',
-        'WEAPON_FIREWORK',
-        'WEAPON_DIGISCANNER',
-        'WEAPON_GARBAGEBAG',
-        'WEAPON_HANDCUFFS',
-        'WEAPON_METALDETECTOR',
-        'WEAPON_BRIEFCASE',
-        'WEAPON_BRIEFCASE_02',
-        'WEAPON_UNARMED'
-    },
-
-    -- Reject any weapon hash that is not explicitly listed in
-    -- WeaponChestDamage. The old DefaultChestDamage fallback meant ANY
-    -- unlisted or garbage hash was treated as 50 damage.
-    RejectUnknownWeapons = true,
-
-    -- The victim's own client must have independently observed real native
-    -- damage in this window before it will apply any compensation. This is
-    -- the main defence: an attacker who never actually shot produces no
-    -- native damage on the victim, so nothing is applied.
-    RequireNativeCorroboration = true,
-    CorroborationWindowMs = 400,
-
-    -- How the victim decides it really was shot.
-    --   'firearm'   (default, correct) -- the entityDamaged game event fired for
-    --               this ped with a firearm weapon hash.
-    --   'anyDamage' (legacy, WEAKER)   -- also accepts a bare health drop, which
-    --               a medical bleed tick, a fall, fire or drowning all satisfy,
-    --               so a fabricated report can ride on unrelated damage.
-    CorroborationMode = 'firearm',
-
-    -- Hard ceiling on compensation the victim will accept, regardless of
-    -- what the server relays. Prevents burst-kills through any hole above.
-    MaxCompensationPerWindow = 60,
-    CompensationWindowMs = 1000,
-
-    -- Never let compensation reduce the victim below
-    -- (PlayerDeathThreshold + MinHealthAfterCompensation). Killing blows must
-    -- come from GTA's own damage so the medical resource sees a real death
-    -- with a real killer.
-    --
-    -- PlayerDeathThreshold matters: a GTA V player ped is widely treated as
-    -- dead at 100, not 0 (health runs 100..200 for players, which is why
-    -- medical resources display health - 100). A bare floor of 2 was therefore
-    -- BELOW the death threshold and did not actually prevent a kill.
-    -- If your server uses a different model, adjust this.
-    PlayerDeathThreshold = 100,
-    MinHealthAfterCompensation = 2,
-
-    -- Require the shooter's ammo count to actually drop before a hit can be
-    -- reported. IsPedShooting alone is a state that stays true for a whole
-    -- automatic burst, which decoupled compensation from rounds fired.
-    RequireAmmoDecrease = true,
-
-    -- Server-side token bucket, per shooter, across ALL targets.
-    RateLimit = {
-        Burst = 5,
-        RefillPerSecond = 4.0
-    },
-
-    -- Visual headshot compensation for scaled peds. GTA's native head
-    -- capsule stays close to the original 1.00 skeleton even when the ped is
-    -- rendered at .87 or 1.10, so aim against the rendered SKEL_Head bone.
-    --
-    -- v45: a head hit is NO LONGER an instant kill. The old behaviour was
-    -- SetEntityHealth(ped, 0) driven by a net event from another player,
-    -- which was both a remote-execute primitive and a death with no killer
-    -- (the medical resource logged it as an unknown self-death). It now
-    -- applies a multiplied, capped damage instead, so a lethal shot still
-    -- goes through GTA's own damage path with proper attribution.
-    Head = {
-        Enabled = true,
-        Radius = 0.18,
-        ZOffset = 0.015,
-        DamageMultiplier = 2.5
-    },
-
-    Torso = {
-        Lower = 0.96,
-        Upper = 1.49,
-        Radius = 0.32,
-        UnknownRadius = 0.34
-    },
-
-    -- KNOWN LIMITATIONS of the compensation model, documented rather than
-    -- silently shipped:
-    --
-    --  * The values below are a hard-coded table, not your server's
-    --    weapons.meta. They are roughly 2x vanilla and ignore any damage
-    --    modifiers you run, so they can shift TTK. MaxCompensationPerWindow
-    --    bounds the effect; tune these to your server if you enable the guard.
-    --  * The compensation ray starts at the gameplay CAMERA, not the weapon
-    --    muzzle, so hip-fire, recoil spread and third-person parallax are not
-    --    modelled. A shot that visually misses can still be scored a hit.
-    --  * The LOS check is ped-to-ped with trace flag 17, so vehicles and other
-    --    players do not block a compensated hit the way they block a bullet.
-    --  * At 0.87 a ped is already harder to hit natively; compensating on top
-    --    of that can over-correct. Consider enabling the guard only for scales
-    --    above 1.00 if your players report this.
-    MaxDamage = 250,
-
-    -- Fallback for weapons not listed in WeaponChestDamage. This is only
-    -- consulted when RejectUnknownWeapons is false; leaving that true (the
-    -- default) is strongly recommended, because this fallback is what let
-    -- any unlisted hash -- including non-firearms -- register as a hit.
-    DefaultChestDamage = 0,
-
-    -- Stun guns are excluded so they do not trigger injury-style damage.
-    WeaponChestDamage = {
-        WEAPON_STUNGUN = 0,
-        WEAPON_STUNGUN_MP = 0,
-
-        WEAPON_PISTOL = 55,
-        WEAPON_COMBATPISTOL = 58,
-        WEAPON_APPISTOL = 40,
-        WEAPON_HEAVYPISTOL = 65,
-        WEAPON_SNSPISTOL = 48,
-        WEAPON_VINTAGEPISTOL = 52,
-
-        WEAPON_MICROSMG = 34,
-        WEAPON_MINISMG = 35,
-        WEAPON_SMG = 38,
-        WEAPON_ASSAULTSMG = 40,
-
-        WEAPON_ASSAULTRIFLE = 55,
-        WEAPON_CARBINERIFLE = 57,
-        WEAPON_SPECIALCARBINE = 58,
-        WEAPON_BULLPUPRIFLE = 55,
-
-        WEAPON_PUMPSHOTGUN = 95,
-        WEAPON_SAWNOFFSHOTGUN = 90,
-        WEAPON_MARKSMANRIFLE = 115,
-        WEAPON_SNIPERRIFLE = 150,
-        WEAPON_HEAVYSNIPER = 220
-    }
-}
+-- v45: Config.HitboxGuard has been REMOVED along with the hitbox guard itself.
+--
+-- The guard compensated for GTA damage capsules not following the visual
+-- matrix scale. It was client-authoritative by construction: the shooter
+-- client decided it landed a hit, and the victim client then damaged itself.
+--
+-- Two independent reasons it is gone rather than hardened:
+--
+--  1. Unsafe. FiveM gives the server no way to verify a shot happened. As
+--     shipped in v44 any player could force any scaled player to die, about
+--     ten times a second, at up to 220m, through walls, with no permissions.
+--     Non-firearms counted too: a fire extinguisher one-tapped a scaled ped.
+--
+--  2. Uncorrectable. The guard exists to compensate shots the engine scored
+--     as a MISS. Any check that the shot really landed therefore refuses
+--     exactly the case the guard exists for, while double-damaging the hits
+--     that already landed. Safety and function are mutually exclusive here.
+--
+-- Consequence, stated plainly: a matrix-scaled ped keeps a small native
+-- hitbox mismatch. At 0.87 the damage capsule sits slightly outside the
+-- rendered body, so some shots that look good will miss; at 1.10 the reverse.
+-- That is accepted as a characteristic of matrix scaling rather than
+-- corrected with client-authoritative damage.
+--
+-- Narrowing Config.Scale.Min/Max toward 1.00 reduces the mismatch if it ever
+-- becomes a problem in practice.
 
 -- ---------------------------------------------------------------------------
 -- v45 config validation.
@@ -537,30 +366,6 @@ function ValidatePedScaleConfig()
             warn('Commands.%s is not a non-empty string; that command is disabled.', key)
             commands[key] = nil
         end
-    end
-
-    local guard = Config.HitboxGuard or {}
-    guard.MaxDamage = math.max(1, math.min(1000, tonumber(guard.MaxDamage) or 250))
-    guard.DefaultChestDamage = math.max(0, tonumber(guard.DefaultChestDamage) or 0)
-    if guard.DefaultChestDamage > 0 and guard.RejectUnknownWeapons == false then
-        warn('HitboxGuard: RejectUnknownWeapons=false with DefaultChestDamage=%d lets ANY '
-            .. 'unlisted weapon hash register a hit. This is strongly discouraged.',
-            guard.DefaultChestDamage)
-    end
-    for weaponName, damage in pairs(guard.WeaponChestDamage or {}) do
-        local value = tonumber(damage)
-        if not value or value < 0 or value > guard.MaxDamage then
-            warn('HitboxGuard.WeaponChestDamage.%s (%s) is invalid or above MaxDamage; set to 0.',
-                tostring(weaponName), tostring(damage))
-            guard.WeaponChestDamage[weaponName] = 0
-        end
-    end
-    guard.MaxCompensationPerWindow = math.max(0, tonumber(guard.MaxCompensationPerWindow) or 60)
-    guard.MinHealthAfterCompensation = math.max(0, tonumber(guard.MinHealthAfterCompensation) or 2)
-
-    if guard.Enabled and guard.RequireNativeCorroboration == false then
-        warn('HitboxGuard is enabled with RequireNativeCorroboration=false. The victim will '
-            .. 'then apply damage on a shooter\'s word alone. Do not run this on a live server.')
     end
 
     return problems

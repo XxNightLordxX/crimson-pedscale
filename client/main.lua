@@ -5,23 +5,6 @@ local appliedGroundOffsets = {}
 local uiOpen = false
 local previewScale = nil
 local ownSavedScale = Config.Scale.Default
-local damageByHash = nil
-local lastShotAt = 0
--- v45: ammo baseline, so compensation is driven by rounds actually fired
--- rather than by the IsPedShooting state.
-local lastSeenAmmo = nil
-local lastSeenWeapon = nil
-local lastNativeDamageAt = 0
--- v45: a dedicated "I was actually shot by a firearm" signal, recorded from the
--- entityDamaged game event (which carries the weapon hash). lastNativeDamageAt
--- below is only "health went down for some reason", which a medical resource's
--- bleed tick, a fall, fire or drowning all satisfy -- so it is far too weak to
--- corroborate a hit report with.
-local lastFirearmDamageAt = 0
-local suppressDamageObservationUntil = 0
-local observedPed = 0
-local observedHealth = nil
-local observedArmor = nil
 
 local function scaleDefaults()
     local default = tonumber(Config.Scale.Default) or 1.0
@@ -1350,24 +1333,9 @@ local firearmGroups = {
     [GetHashKey('GROUP_SNIPER')] = true
 }
 
--- v45 unconditional deny list, mirroring the server's. Checked before the
--- group test because group membership is not sufficient: GTA classifies
--- WEAPON_FLAREGUN as GROUP_PISTOL, and IsPedShooting() is true while a player
--- sprays a fire extinguisher or petrol can. Those must never be treated as
--- gunshots by any part of this resource.
-local deniedCompensationWeapons = {}
-for _, weaponName in ipairs((Config.HitboxGuard or {}).NeverCompensate or {}) do
-    deniedCompensationWeapons[GetHashKey(weaponName)] = true
-end
-
-local function isDeniedCompensationWeapon(weaponHash)
-    return deniedCompensationWeapons[tonumber(weaponHash) or 0] == true
-end
-
 local function isFirearmDamageWeapon(weaponHash)
     weaponHash = tonumber(weaponHash) or 0
     if weaponHash == 0 then return false end
-    if isDeniedCompensationWeapon(weaponHash) then return false end
 
     local group = GetWeapontypeGroup(weaponHash)
     return firearmGroups[group] == true
@@ -1393,13 +1361,6 @@ AddEventHandler('entityDamaged', function(victim, _culprit, weapon, _baseDamage)
     -- by clamping VELOCITY in the tackle thread. Health is never rewritten.
 
     if not isFirearmDamageWeapon(weapon) then return end
-
-    -- Record the precise corroboration signal: this client's own ped was hit by
-    -- a real firearm, according to the engine. Only this authorises the hitbox
-    -- guard to apply compensation.
-    if victim == PlayerPedId() then
-        lastFirearmDamageAt = GetGameTimer()
-    end
 
     beginDamageImpactStabilizer(victim)
 end)
@@ -1437,361 +1398,28 @@ CreateThread(function()
     end
 end)
 
-local function buildDamageMap()
-    if damageByHash then return damageByHash end
-
-    damageByHash = {}
-    for weaponName, damage in pairs(Config.HitboxGuard.WeaponChestDamage or {}) do
-        damageByHash[GetHashKey(weaponName)] = tonumber(damage) or 0
-    end
-
-    return damageByHash
-end
-
-local function chestDamageForWeapon(weaponHash)
-    local map = buildDamageMap()
-    local configured = map[tonumber(weaponHash)]
-    if configured ~= nil then return configured end
-
-    -- v45: keep this in step with the server copy. RejectUnknownWeapons was
-    -- initially only added server-side, so the client still fell back to
-    -- DefaultChestDamage for any unlisted hash and would report hits the
-    -- server then discarded.
-    if Config.HitboxGuard.RejectUnknownWeapons ~= false then return 0 end
-    return tonumber(Config.HitboxGuard.DefaultChestDamage) or 0
-end
-
-local function cameraRay()
-    local startPos = GetGameplayCamCoord()
-    local rot = GetGameplayCamRot(2)
-    local rz = math.rad(rot.z)
-    local rx = math.rad(rot.x)
-    local cosX = math.abs(math.cos(rx))
-    local direction = vector3(-math.sin(rz) * cosX, math.cos(rz) * cosX, math.sin(rx))
-    return startPos, direction
-end
-
-local function pointRayDistance(point, rayStart, rayDirection)
-    local rel = point - rayStart
-    local t = rel.x * rayDirection.x + rel.y * rayDirection.y + rel.z * rayDirection.z
-    if t <= 0.0 then return 9999.0, t end
-
-    local nearest = rayStart + rayDirection * t
-    return #(point - nearest), t
-end
-
-local function rayHitsVisualHead(rayStart, rayDirection, ped, scale)
-    local head = Config.HitboxGuard.Head or {}
-    local normalized = clampScale(scale)
-
-    -- Use the rendered head bone instead of GTA's native damage capsule.
-    -- SetEntityMatrix visually scales the skeleton, but the native hit capsule
-    -- does not always follow it at .87 / 1.10. Bone position DOES follow the
-    -- rendered ped, so this tracks what the shooter is actually aiming at.
-    local headBone = GetPedBoneIndex(ped, 31086) -- SKEL_Head
-    if not headBone or headBone == -1 then return false, 0.0 end
-
-    local center = GetWorldPositionOfEntityBone(ped, headBone)
-    if not center then return false, 0.0 end
-
-    local radiusBase = tonumber(head.Radius) or 0.18
-    local radius = radiusBase * math.max(0.90, normalized)
-    local zOffset = (tonumber(head.ZOffset) or 0.015) * normalized
-    center = vector3(center.x, center.y, center.z + zOffset)
-
-    local distance, t = pointRayDistance(center, rayStart, rayDirection)
-    return distance <= radius, t
-end
-
-local function torsoBounds(ped, scale)
-    local base = GetEntityCoords(ped)
-    local torso = Config.HitboxGuard.Torso or {}
-    local lowerBase = tonumber(torso.Lower) or 0.96
-    local upperBase = tonumber(torso.Upper) or 1.49
-    local radiusBase = tonumber(torso.Radius) or 0.32
-    local unknownRadius = tonumber(torso.UnknownRadius) or 0.34
-    local knownScale = scale and not isDefaultScale(scale)
-
-    if knownScale then
-        local normalized = clampScale(scale)
-        return base.z + lowerBase * normalized, base.z + upperBase * normalized, radiusBase * math.max(0.95, normalized)
-    end
-
-    local _, minScale, maxScale = scaleDefaults()
-    return base.z + lowerBase * minScale, base.z + upperBase * maxScale, unknownRadius
-end
-
-local function rayHitsVisualTorso(rayStart, rayDirection, ped, scale)
-    local lowerZ, upperZ, radius = torsoBounds(ped, scale)
-    local base = GetEntityCoords(ped)
-    local center = vector3(base.x, base.y, (lowerZ + upperZ) * 0.5)
-    local bestDistance = 9999.0
-    local bestT = 0.0
-
-    for i = 0, 16 do
-        local z = lowerZ + (upperZ - lowerZ) * (i / 16.0)
-        local point = vector3(center.x, center.y, z)
-        local distance, t = pointRayDistance(point, rayStart, rayDirection)
-        if distance < bestDistance then
-            bestDistance = distance
-            bestT = t
-        end
-    end
-
-    return bestDistance <= radius, bestT
-end
-
-local function findVisualHitTarget(localPed)
-    local rayStart, rayDirection = cameraRay()
-    local localCoords = GetEntityCoords(localPed)
-    local maxDistance = tonumber(Config.HitboxGuard.CandidateDistance) or 200.0
-    local bestHead = nil
-    local bestChest = nil
-
-    for _, player in ipairs(GetActivePlayers()) do
-        if player ~= PlayerId() and NetworkIsPlayerActive(player) then
-            local targetPed = GetPlayerPed(player)
-            local targetServerId = GetPlayerServerId(player)
-            local targetScale = effectiveScale(targetServerId)
-
-            -- v45: never target a downed / bleeding-out / dead player. Medical
-            -- resources keep those peds alive at a fixed health, so the old
-            -- IsEntityDead check inside shouldScalePed did not exclude them and
-            -- a downed player could be executed, skipping the EMS revive window.
-            if not (Config.HitboxGuard.OnlyScaledTargets and isDefaultScale(targetScale))
-                and not isPedDowned(targetPed, targetServerId)
-                and shouldScalePed(targetPed, targetServerId)
-                and #(GetEntityCoords(targetPed) - localCoords) <= maxDistance
-                and HasEntityClearLosToEntity(localPed, targetPed, 17)
-            then
-                local headHit, headT = rayHitsVisualHead(rayStart, rayDirection, targetPed, targetScale)
-                if headHit and (not bestHead or headT < bestHead.t) then
-                    bestHead = {
-                        serverId = targetServerId,
-                        t = headT,
-                        kind = 'head'
-                    }
-                end
-
-                local chestHit, chestT = rayHitsVisualTorso(rayStart, rayDirection, targetPed, targetScale)
-                if chestHit and (not bestChest or chestT < bestChest.t) then
-                    bestChest = {
-                        serverId = targetServerId,
-                        t = chestT,
-                        kind = 'chest'
-                    }
-                end
-            end
-        end
-    end
-
-    -- Head always wins when the crosshair intersects the visual head. This is
-    -- what restores one-tap headshots when the native capsule is misaligned.
-    return bestHead or bestChest
-end
-
-CreateThread(function()
-    while true do
-        Wait(50)
-
-        local ped = PlayerPedId()
-        if ped ~= observedPed then
-            observedPed = ped
-            observedHealth = GetEntityHealth(ped)
-            observedArmor = GetPedArmour(ped)
-        end
-
-        local health = GetEntityHealth(ped)
-        local armor = GetPedArmour(ped)
-        local now = GetGameTimer()
-
-        if observedHealth and observedArmor and (health < observedHealth or armor < observedArmor) then
-            if now > suppressDamageObservationUntil then
-                lastNativeDamageAt = now
-            end
-        end
-
-        observedHealth = health
-        observedArmor = armor
-    end
-end)
-
-CreateThread(function()
-    while true do
-        if not Config.HitboxGuard.Enabled then
-            Wait(1000)
-        else
-            Wait(0)
-
-            local ped = PlayerPedId()
-
-            -- v45: IsPedShooting is a STATE, true for a whole automatic burst
-            -- and for a tail after each discrete shot. Gating on it plus a
-            -- fixed 115 ms timer decoupled compensation from rounds actually
-            -- fired: roughly 8.7 "free" hits/second, and on slow weapons more
-            -- compensations than bullets. Require real ammo consumption so at
-            -- most one compensation exists per round discharged.
-            --
-            -- The baseline is sampled EVERY tick, not only while shooting.
-            -- Sampling it inside the shooting branch meant the first round after
-            -- every weapon swap had no baseline and was silently dropped.
-            local firedRound = true
-            if ped ~= 0 and Config.HitboxGuard.RequireAmmoDecrease ~= false then
-                local weaponNow = GetSelectedPedWeapon(ped)
-                local okAmmo, ammo = pcall(GetAmmoInPedWeapon, ped, weaponNow)
-                if okAmmo and type(ammo) == 'number' then
-                    if lastSeenWeapon == weaponNow and lastSeenAmmo ~= nil then
-                        firedRound = ammo < lastSeenAmmo
-                    else
-                        firedRound = false      -- no baseline for this weapon yet
-                    end
-                    lastSeenAmmo = ammo
-                    lastSeenWeapon = weaponNow
-                else
-                    -- Native unavailable: fall back to the state-only behaviour
-                    -- rather than disabling the guard entirely.
-                    firedRound = true
-                end
-            end
-
-            if ped ~= 0 and not IsEntityDead(ped) and IsPedShooting(ped) then
-                local now = GetGameTimer()
-                local cooldown = tonumber(Config.HitboxGuard.ShotCooldownMs) or 115
-
-                if firedRound and now - lastShotAt >= cooldown then
-                    lastShotAt = now
-
-                    local weaponHash = GetSelectedPedWeapon(ped)
-                    -- v45: IsPedShooting is also true for snowballs, balls,
-                    -- flare guns, petrol cans and fire extinguishers. Reject
-                    -- anything that is not a real firearm before reporting,
-                    -- so those can never register as a compensated hit.
-                    local damage = isFirearmDamageWeapon(weaponHash) and chestDamageForWeapon(weaponHash) or 0
-                    if damage > 0 and damage <= (tonumber(Config.HitboxGuard.MaxDamage) or 250) then
-                        local target = findVisualHitTarget(ped)
-                        if target then
-                            local isHead = target.kind == 'head'
-                                and (Config.HitboxGuard.Head or {}).Enabled ~= false
-                            -- Both paths now wait for the native damage window so
-                            -- the victim can corroborate the shot locally. The head
-                            -- path used to skip this and command an instant kill.
-                            CreateThread(function()
-                                Wait(tonumber(Config.HitboxGuard.NativeDamageDelayMs) or 175)
-                                TriggerServerEvent(isHead
-                                    and 'crimson-pedscale:server:visualHeadHit'
-                                    or 'crimson-pedscale:server:visualChestHit',
-                                    target.serverId, weaponHash)
-                            end)
-                        end
-                    end
-                end
-            end
-        end
-    end
-end)
-
--- ---------------------------------------------------------------------------
--- v45 victim-side compensation.
+-- v45: the hitbox guard has been REMOVED.
 --
--- Replaces applyVisualHeadshot + applyVisualChestDamage with ONE handler that
--- can never kill and never fires on a shooter's word alone.
+-- It compensated for GTA damage capsules not following the visual matrix
+-- scale, by having the shooter client ray-test the rendered head/torso,
+-- report to the server, and the server tell the VICTIM client to damage
+-- itself. That design cannot be made safe OR correct:
 --
--- What changed and why:
---  * The head path used to be SetEntityHealth(ped, 0) with no corroboration,
---    no armour, no range check. Any player could drive it ~10x/second against
---    any scaled player. It is gone.
---  * Compensation now requires the victim's OWN client to have independently
---    observed real native damage inside CorroborationWindowMs. An attacker who
---    never actually shot produces no native damage here, so nothing applies.
---  * Total compensation is capped per rolling window, and can never take the
---    victim below MinHealthAfterCompensation. The killing blow must come from
---    GTA's own damage so the medical resource sees a real death with a real
---    killer instead of an unattributed self-death.
--- ---------------------------------------------------------------------------
-local compensationWindowStart = 0
-local compensationInWindow = 0
-
-RegisterNetEvent('crimson-pedscale:client:applyVisualDamage', function(damage, _shooter, _weaponHash, isHeadshot)
-    if not Config.HitboxGuard.Enabled then return end
-
-    local guard = Config.HitboxGuard
-    damage = math.floor((tonumber(damage) or 0) + 0.5)
-    if damage <= 0 or damage > (tonumber(guard.MaxDamage) or 250) then return end
-
-    local ped = PlayerPedId()
-    if ped == 0 then return end
-
-    -- Never touch a downed, dying or dead player. Medical resources keep such
-    -- peds ALIVE at a non-zero health, so IsEntityDead alone is not enough:
-    -- without this a second report finished off a bleeding-out player and
-    -- skipped the entire EMS revive window.
-    if isPedDowned(ped, ownServerId()) then return end
-
-    local now = GetGameTimer()
-
-    -- Corroboration: only top up damage the engine actually delivered here.
-    --
-    -- This uses lastFirearmDamageAt (the entityDamaged game event, which carries
-    -- the weapon hash), NOT a bare health drop. A medical resource's bleed tick,
-    -- a fall, fire or drowning all lower health, and accepting those would let a
-    -- fabricated report land whenever the victim happened to be taking any
-    -- damage at all.
-    if guard.RequireNativeCorroboration ~= false then
-        local window = tonumber(guard.CorroborationWindowMs) or 400
-        local signal = (guard.CorroborationMode == 'anyDamage')
-            and math.max(lastFirearmDamageAt, lastNativeDamageAt)
-            or lastFirearmDamageAt
-        if signal <= 0 or (now - signal) > window then
-            return
-        end
-    end
-
-    -- Rolling cap on how much compensation this client will accept.
-    local windowMs = tonumber(guard.CompensationWindowMs) or 1000
-    if (now - compensationWindowStart) > windowMs then
-        compensationWindowStart = now
-        compensationInWindow = 0
-    end
-
-    local allowance = math.max(0, (tonumber(guard.MaxCompensationPerWindow) or 60) - compensationInWindow)
-    if allowance <= 0 then return end
-    if damage > allowance then damage = allowance end
-
-    -- Never deal the killing blow.
-    -- Floor is relative to the player death threshold, not zero: a GTA V player
-    -- ped dies at 100, so an absolute floor of 2 sat below it and still allowed
-    -- an unattributed kill.
-    local deathFloor = math.max(0, tonumber(guard.PlayerDeathThreshold) or 100)
-    local minHealth = deathFloor + math.max(0, tonumber(guard.MinHealthAfterCompensation) or 2)
-    local health = GetEntityHealth(ped)
-    local armor = GetPedArmour(ped)
-    local headroom = math.max(0, (health - minHealth) + armor)
-    if headroom <= 0 then return end
-    if damage > headroom then damage = headroom end
-    if damage <= 0 then return end
-
-    compensationInWindow = compensationInWindow + damage
-    suppressDamageObservationUntil = now + 150
-
-    local remaining = damage
-    if armor > 0 then
-        local absorbed = math.min(armor, remaining)
-        SetPedArmour(ped, armor - absorbed)
-        remaining = remaining - absorbed
-    end
-
-    if remaining > 0 then
-        SetEntityHealth(ped, math.max(minHealth, health - remaining))
-    end
-
-    observedHealth = GetEntityHealth(ped)
-    observedArmor = GetPedArmour(ped)
-
-    if Config.Debug then
-        print(('^3[crimson-pedscale]^0 compensation applied: %d (%s)')
-            :format(damage, isHeadshot and 'head' or 'chest'))
-    end
-end)
+--  * Unsafe: FiveM gives the server no way to verify a shot happened, so any
+--    client could report hits it never fired. As shipped in v44 this was an
+--    unauthenticated remote kill at roughly 10 forced deaths per second.
+--  * Uncorrectable: the guard exists to compensate shots the engine scored as
+--    a MISS. Requiring proof the shot landed therefore refuses exactly the
+--    case it exists for, while double-damaging the hits that already landed.
+--    Security and function are in direct contradiction.
+--
+-- Removed entirely rather than shipped broken. Scaled peds keep a small
+-- native hitbox mismatch: at 0.87 the damage capsule sits slightly outside
+-- the rendered body, so some visually-good shots miss. That is accepted as a
+-- gameplay characteristic of matrix scaling.
+--
+-- Gone with it: the shooter ray-test, the shot-detection thread, the health
+-- observer, and every SetEntityHealth / SetPedArmour write in this resource.
 
 
 -- ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@ game 'gta5'
 lua54 'yes'
 
 author 'Crimson RP'
-description 'Crimson RP ped scale menu with scaled chest hit guard (v45 security hardening)'
+description 'Crimson RP ped scale menu (v45 - hitbox guard removed, security hardened)'
 version '1.1.0'
 
 shared_script 'shared/config.lua'
