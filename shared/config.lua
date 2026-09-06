@@ -13,8 +13,20 @@ Config.Permission = {
     -- Set true if every player may open /pedscale for themselves.
     AllowEveryoneSelfMenu = false,
 
-    -- Also let FiveM block the commands before the script handler runs.
-    RestrictCommandsWithAce = true,
+    -- Ask FiveM to block the commands before the script handler runs.
+    --
+    -- IMPORTANT: RegisterCommand(name, fn, true) makes FiveM check the ace
+    -- object `command.<name>` -- NOT Config.Permission.Ace. Leaving this true
+    -- while only granting `crimson.pedscale` blocks all four commands for
+    -- everyone, which is why it now defaults to false. The in-handler
+    -- permission check below still runs either way, so false is safe.
+    --
+    -- Set this back to true ONLY if you also add, for every command name:
+    --   add_ace group.admin command.pedscale allow
+    --   add_ace group.admin command.givepedscale allow
+    --   add_ace group.admin command.setpedscale allow
+    --   add_ace group.admin command.resetpedscale allow
+    RestrictCommandsWithAce = false,
 
     -- Recommended: add_ace group.admin crimson.pedscale allow
     UseAce = true,
@@ -24,6 +36,13 @@ Config.Permission = {
     Identifiers = {},
 
     -- Used when qb-core/qbx_core/es_extended are running and expose permissions.
+    --
+    -- NOTE for Qbox: exports.qbx_core:HasPermission is marked @deprecated
+    -- upstream and its body is just IsPlayerAceAllowed(source, permission),
+    -- i.e. it checks the BARE ace object ('admin'), not 'group.admin'. A stock
+    -- Qbox install grants no 'god' ace at all, so that entry is inert there.
+    -- The reliable path on Qbox is the ace check above:
+    --   add_ace group.admin crimson.pedscale allow
     QBCoreGroups = { 'admin', 'god' },
     ESXGroups = { 'admin', 'superadmin' }
 }
@@ -182,10 +201,94 @@ Config.Scale = {
         MaxDownwardVelocity = -2.50
     },
 
+    -- v40 short-ped tackle handling, reworked in v45.
+    --
+    -- v40-v44 restored the local player's health whenever a short ped took
+    -- ANY non-firearm damage inside a 900 ms window that re-armed whenever
+    -- another player stood within 2.35 m. Because "non-firearm" covered
+    -- melee, thrown, explosive, fire, vehicle and fall damage, that was an
+    -- indefinitely re-armable damage-immunity window -- a godmode bug, and
+    -- exactly the pattern a server anticheat looks for.
+    --
+    -- v45 removes the health write entirely. The bogus upward impulse that
+    -- caused the original problem is dealt with where it belongs: by
+    -- clamping VELOCITY, which this guard already did.
+    TackleGuard = {
+        Enabled = true,
+        NearbyPlayerRadius = 2.35,
+        PhysicsWindowMs = 900,
+        MaxUpwardVelocity = 0.08,
+        -- Poll interval while a short ped is idle. The old code spun at
+        -- Wait(0) permanently for every scaled player.
+        IdlePollMs = 120,
+
+        -- Left for reference; v45 never restores health under any setting.
+        -- Kept so an existing config file does not error on load.
+        RestoreHealth = false
+    },
+
     -- Matrix scaling peds inside vehicles is prone to visual jitter.
     DisableInVehicles = true,
     DisableWhenInvisible = true,
     DisableWhenDead = true
+}
+
+-- v45 compatibility layer.
+--
+-- Medical resources (qbx_medical, sc-ambulance, qb-ambulancejob, ...) keep a
+-- "downed" player's ped ALIVE -- they call NetworkResurrectLocalPlayer and
+-- then set health to a non-zero value so the ped can play a bleed-out
+-- animation. IsEntityDead() is therefore FALSE for the whole last-stand and
+-- even the fully-dead window.
+--
+-- Config.Scale.DisableWhenDead relies on IsEntityDead, so without this
+-- layer the scaler keeps ground-anchoring a prone body and the hitbox guard
+-- keeps treating a bleeding-out player as a valid target -- which let a
+-- downed player be finished off, skipping the EMS revive window entirely.
+--
+-- Nothing here modifies another resource. It only READS state those
+-- resources already publish.
+Config.Compat = {
+    -- Statebags to consult on the LOCAL player. Checked with
+    -- LocalPlayer.state[<name>]; any truthy value means "downed".
+    LocalStateFlags = { 'dead', 'isDead', 'laststand', 'inLaststand', 'buckled' },
+
+    -- Statebags to consult on OTHER players, via Player(serverId).state.
+    PlayerStateFlags = { 'dead', 'isDead', 'laststand', 'inLaststand' },
+
+    -- Also treat a ped as downed when GTA itself reports it fatally injured.
+    UseIsPedFatallyInjured = true,
+
+    -- Health at or below this counts as downed even if no statebag is set.
+    -- Medical resources commonly park last-stand players at a fixed value.
+    DownedHealthThreshold = 1
+}
+
+-- v45 inbound event rate limiting (server side).
+--
+-- Every client-callable event used to be unauthenticated AND unbounded, and
+-- requestData / characterTransition each fan out a TriggerClientEvent(-1)
+-- broadcast to every player. One client could turn 1 event into N packets.
+Config.Limits = {
+    Enabled = true,
+    -- Minimum milliseconds between accepted calls, per player, per event.
+    -- requestData RESTORES a scale; characterTransition CLEARS it. The restore
+    -- cooldown must be strictly shorter than the clear cooldown, otherwise a
+    -- character switch inside the gap clears the scale and then has its restore
+    -- rejected, leaving the player stuck at 1.00 until the next trigger.
+    PerEventCooldownMs = {
+        requestData = 1000,
+        characterTransition = 1500,
+        saveScale = 750,
+        resetScale = 750,
+        menuDeclined = 1000
+    },
+    DefaultCooldownMs = 500,
+
+    -- Drop a player's traffic entirely for this long after they exceed the
+    -- allowance repeatedly, so spam cannot be sustained.
+    AbusePenaltyMs = 10000,
+    AbuseStrikes = 8
 }
 
 Config.Persistence = {
@@ -200,65 +303,97 @@ Config.Notifications = {
     UseChat = true
 }
 
-Config.HitboxGuard = {
-    -- Entity-matrix scaling changes the visual body more than GTA's native
-    -- damage capsule. This guard compensates chest shots that visually land.
-    Enabled = true,
-    OnlyScaledTargets = true,
+-- v45: Config.HitboxGuard has been REMOVED along with the hitbox guard itself.
+--
+-- The guard compensated for GTA damage capsules not following the visual
+-- matrix scale. It was client-authoritative by construction: the shooter
+-- client decided it landed a hit, and the victim client then damaged itself.
+--
+-- Two independent reasons it is gone rather than hardened:
+--
+--  1. Unsafe. FiveM gives the server no way to verify a shot happened. As
+--     shipped in v44 any player could force any scaled player to die, about
+--     ten times a second, at up to 220m, through walls, with no permissions.
+--     Non-firearms counted too: a fire extinguisher one-tapped a scaled ped.
+--
+--  2. Uncorrectable. The guard exists to compensate shots the engine scored
+--     as a MISS. Any check that the shot really landed therefore refuses
+--     exactly the case the guard exists for, while double-damaging the hits
+--     that already landed. Safety and function are mutually exclusive here.
+--
+-- Consequence, stated plainly: a matrix-scaled ped keeps a small native
+-- hitbox mismatch. At 0.87 the damage capsule sits slightly outside the
+-- rendered body, so some shots that look good will miss; at 1.10 the reverse.
+-- That is accepted as a characteristic of matrix scaling rather than
+-- corrected with client-authoritative damage.
+--
+-- Narrowing Config.Scale.Min/Max toward 1.00 reduces the mismatch if it ever
+-- becomes a problem in practice.
 
-    RayDistance = 220.0,
-    CandidateDistance = 200.0,
-    ShotCooldownMs = 115,
-    NativeDamageDelayMs = 175,
-    NativeDamageWindowMs = 350,
-    ServerCooldownMs = 95,
+-- ---------------------------------------------------------------------------
+-- v45 config validation.
+--
+-- Previously a bad Config value failed silently (Min > Max quietly swapped,
+-- a nil command name crashed RegisterCommand, an absurd damage value was
+-- accepted). Validate once at start, clamp what can be clamped, and print a
+-- clear warning for what cannot.
+-- ---------------------------------------------------------------------------
+function ValidatePedScaleConfig()
+    local problems = {}
 
-    -- Visual headshot compensation for scaled peds. GTA's native head
-    -- capsule stays close to the original 1.00 skeleton even when the ped is
-    -- rendered at .87 or 1.10, so aim against the rendered SKEL_Head bone.
-    -- Any valid firearm hit inside this sphere is a one-tap kill.
-    Head = {
-        Enabled = true,
-        Radius = 0.18,
-        ZOffset = 0.015
-    },
+    local function warn(fmt, ...)
+        problems[#problems + 1] = select('#', ...) > 0 and fmt:format(...) or fmt
+    end
 
-    Torso = {
-        Lower = 0.96,
-        Upper = 1.49,
-        Radius = 0.32,
-        UnknownRadius = 0.34
-    },
+    local scale = Config.Scale or {}
+    scale.Min = tonumber(scale.Min) or 0.87
+    scale.Max = tonumber(scale.Max) or 1.10
+    scale.Default = tonumber(scale.Default) or 1.0
 
-    MaxDamage = 250,
-    DefaultChestDamage = 50,
+    if scale.Min > scale.Max then
+        warn('Scale.Min (%.2f) was greater than Scale.Max (%.2f); swapped.', scale.Min, scale.Max)
+        scale.Min, scale.Max = scale.Max, scale.Min
+    end
+    if scale.Min <= 0.0 then
+        warn('Scale.Min must be > 0; clamped to 0.5.')
+        scale.Min = 0.5
+    end
+    if scale.Default < scale.Min or scale.Default > scale.Max then
+        warn('Scale.Default (%.2f) outside [%.2f, %.2f]; clamped.', scale.Default, scale.Min, scale.Max)
+        scale.Default = math.min(scale.Max, math.max(scale.Min, scale.Default))
+    end
+    scale.RenderDistance = math.max(10.0, tonumber(scale.RenderDistance) or 100.0)
 
-    -- Stun guns are excluded so they do not trigger injury-style damage.
-    WeaponChestDamage = {
-        WEAPON_STUNGUN = 0,
-        WEAPON_STUNGUN_MP = 0,
+    local commands = Config.Commands or {}
+    for _, key in ipairs({ 'OpenMenu', 'GiveMenu', 'SetScale', 'ResetScale' }) do
+        local name = commands[key]
+        if type(name) ~= 'string' or name == '' then
+            warn('Commands.%s is not a non-empty string; that command is disabled.', key)
+            commands[key] = nil
+        end
+    end
 
-        WEAPON_PISTOL = 55,
-        WEAPON_COMBATPISTOL = 58,
-        WEAPON_APPISTOL = 40,
-        WEAPON_HEAVYPISTOL = 65,
-        WEAPON_SNSPISTOL = 48,
-        WEAPON_VINTAGEPISTOL = 52,
+    return problems
+end
 
-        WEAPON_MICROSMG = 34,
-        WEAPON_MINISMG = 35,
-        WEAPON_SMG = 38,
-        WEAPON_ASSAULTSMG = 40,
+-- Re-runs validation (idempotent -- the values are already clamped) purely to
+-- collect the human-readable warnings for printing.
+function ReportPedScaleConfig(sideLabel)
+    local problems = ValidatePedScaleConfig()
+    if #problems == 0 then return end
+    print(('^3[crimson-pedscale]^0 %s config warnings (%d):'):format(sideLabel, #problems))
+    for i = 1, #problems do
+        print(('^3[crimson-pedscale]^0   %d. %s'):format(i, problems[i]))
+    end
+end
 
-        WEAPON_ASSAULTRIFLE = 55,
-        WEAPON_CARBINERIFLE = 57,
-        WEAPON_SPECIALCARBINE = 58,
-        WEAPON_BULLPUPRIFLE = 55,
-
-        WEAPON_PUMPSHOTGUN = 95,
-        WEAPON_SAWNOFFSHOTGUN = 90,
-        WEAPON_MARKSMANRIFLE = 115,
-        WEAPON_SNIPERRIFLE = 150,
-        WEAPON_HEAVYSNIPER = 220
-    }
-}
+-- Run validation HERE, at the bottom of the shared config, rather than from an
+-- onResourceStart handler. config.lua is a shared_script and loads before
+-- client/main.lua and server/main.lua, so this guarantees the clamped values
+-- are in place before any consumer's top-level code reads them -- including
+-- RegisterCommand, which previously executed with the raw, unvalidated command
+-- names that validation claimed to protect.
+--
+-- ReportPedScaleConfig is still called from onResourceStart on each side so the
+-- warnings are printed once per environment with a client/server label.
+ValidatePedScaleConfig()

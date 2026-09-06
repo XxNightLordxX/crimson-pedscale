@@ -1,12 +1,53 @@
 local playerScales = {}
 local menuGrants = {}
-local lastVisualHit = {}
-local weaponDamageByHash = nil
 
 local function debugPrint(message)
     if Config.Debug then
         print(('^3[crimson-pedscale]^0 %s'):format(message))
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- v45 inbound rate limiting.
+--
+-- Every client-callable event here used to be unauthenticated AND unbounded.
+-- requestData and characterTransition additionally fan out a
+-- TriggerClientEvent(-1) broadcast, so a single client could turn one event
+-- into one packet per connected player -- a 1:N amplification primitive.
+-- ---------------------------------------------------------------------------
+local eventClock = {}   -- [src][eventName] = last accepted GetGameTimer()
+local abuseState = {}   -- [src] = { strikes = n, blockedUntil = ms }
+
+local function rateLimit(src, eventName)
+    local limits = Config.Limits or {}
+    if limits.Enabled == false then return true end
+
+    local now = GetGameTimer()
+    local abuse = abuseState[src]
+    if abuse and abuse.blockedUntil and now < abuse.blockedUntil then
+        return false
+    end
+
+    local cooldown = (limits.PerEventCooldownMs or {})[eventName]
+        or tonumber(limits.DefaultCooldownMs) or 500
+
+    eventClock[src] = eventClock[src] or {}
+    local last = eventClock[src][eventName]
+    if last and (now - last) < cooldown then
+        abuse = abuse or { strikes = 0 }
+        abuse.strikes = (abuse.strikes or 0) + 1
+        if abuse.strikes >= (tonumber(limits.AbuseStrikes) or 8) then
+            abuse.blockedUntil = now + (tonumber(limits.AbusePenaltyMs) or 10000)
+            abuse.strikes = 0
+            debugPrint(('rate-limit penalty applied to %s for %s'):format(src, eventName))
+        end
+        abuseState[src] = abuse
+        return false
+    end
+
+    eventClock[src][eventName] = now
+    if abuse then abuse.strikes = 0 end
+    return true
 end
 
 local function notify(src, message, kind)
@@ -33,9 +74,25 @@ local function scaleDefaults()
     return default, minScale, maxScale
 end
 
+local function isFiniteNumber(value)
+    -- NaN is the trap: IEEE-754 makes every comparison against NaN false, so
+    -- `value < min` and `value > max` BOTH fail and a NaN passes through a
+    -- min/max clamp completely untouched. `value ~= value` is the NaN test.
+    return type(value) == 'number'
+        and value == value
+        and value ~= math.huge
+        and value ~= -math.huge
+end
+
 local function clampScale(scale)
     local default, minScale, maxScale = scaleDefaults()
-    local value = tonumber(scale) or default
+    local value = tonumber(scale)
+    -- v45: reject non-finite input before clamping. Previously a NaN sent by a
+    -- modified client survived clampScale intact, was stored to KVP as "-nan",
+    -- and was broadcast to every player. Each receiving client then fed nine
+    -- NaN basis components and a NaN world Z into SetEntityMatrix once per
+    -- frame -- an invalid transform on a networked entity.
+    if not isFiniteNumber(value) then value = default end
     if value < minScale then value = minScale end
     if value > maxScale then value = maxScale end
     return math.floor((value * 100.0) + 0.5) / 100.0
@@ -43,26 +100,18 @@ end
 
 local function isDefaultScale(scale)
     local default = scaleDefaults()
-    return math.abs((tonumber(scale) or default) - default) < 0.001
+    local value = tonumber(scale)
+    -- A non-finite value is not "the default", but it must never be treated as
+    -- a legitimate custom scale either: math.abs(nan - 1.0) < 0.001 is false,
+    -- which is how a NaN previously got published as a real scale.
+    if not isFiniteNumber(value) then return true end
+    return math.abs(value - default) < 0.001
 end
 
-local function findIdentifier(src, prefix)
-    local wanted = prefix .. ':'
-    for _, identifier in ipairs(GetPlayerIdentifiers(src)) do
-        if identifier:sub(1, #wanted) == wanted then
-            return identifier
-        end
-    end
-    return nil
-end
-
-local function primaryIdentifier(src)
-    for _, prefix in ipairs(Config.Persistence.IdentifierPriority or {}) do
-        local identifier = findIdentifier(src, prefix)
-        if identifier then return identifier end
-    end
-    return GetPlayerIdentifier(src, 0)
-end
+-- v45: findIdentifier/primaryIdentifier removed. Persistence keys on the
+-- Qbox/QBCore citizenid (see characterIdentifier below), so the license
+-- identifier lookup was unreachable. Config.Persistence.IdentifierPriority is
+-- retained for config compatibility but is no longer consulted.
 
 -- v30: Persist scale by CHARACTER, not by Rockstar/license account.
 -- Qbox/QBCore citizenid is stable per character, so a .87 character can coexist
@@ -248,14 +297,20 @@ RegisterNetEvent('crimson-pedscale:server:requestData', function()
     local src = source
     local citizenid = characterIdentifier(src)
 
-    -- Character swaps reuse the same server ID. Clear the previous character's
-    -- live scale before loading anything for the newly selected character.
+    -- Check readiness BEFORE spending the rate-limit slot. When character data
+    -- is not ready the client is expected to retry; consuming the slot here
+    -- would reject that retry and leave the player at the default scale.
     if not citizenid then
         local default = scaleDefaults()
         publishScale(src, default)
         TriggerClientEvent('crimson-pedscale:client:fullSync', src, publicScales(), default)
         return
     end
+
+    if not rateLimit(src, 'requestData') then return end
+
+    -- Character swaps reuse the same server ID; the not-ready branch above has
+    -- already cleared the previous character's live scale.
 
     local savedScale = loadPlayerScale(src)
     publishScale(src, savedScale)
@@ -267,12 +322,29 @@ end)
 -- same server ID while the character selector/new ped is loading.
 RegisterNetEvent('crimson-pedscale:server:characterTransition', function()
     local src = source
+    if not rateLimit(src, 'characterTransition') then return end
     publishScale(src, scaleDefaults())
     menuGrants[src] = nil
 end)
 
+-- The client could not open the menu because another resource already holds
+-- NUI focus. Release the grant so it is not left dangling, and tell whoever
+-- opened it what actually happened.
+RegisterNetEvent('crimson-pedscale:server:menuDeclined', function()
+    local src = source
+    if not rateLimit(src, 'menuDeclined') then return end
+
+    local grant = menuGrants[src]
+    menuGrants[src] = nil
+    if grant and grant.opener and grant.opener ~= src and GetPlayerName(grant.opener) then
+        notify(grant.opener,
+            ('ID %s is in another menu; the scale menu did not open.'):format(src), 'error')
+    end
+end)
+
 RegisterNetEvent('crimson-pedscale:server:saveScale', function(scale)
     local src = source
+    if not rateLimit(src, 'saveScale') then return end
     if not canUseMenu(src) then
         debugPrint(('blocked save from %s'):format(src))
         return
@@ -287,6 +359,7 @@ end)
 
 RegisterNetEvent('crimson-pedscale:server:resetScale', function()
     local src = source
+    if not rateLimit(src, 'resetScale') then return end
     if not canUseMenu(src) then
         debugPrint(('blocked reset from %s'):format(src))
         return
@@ -388,118 +461,32 @@ RegisterCommand(Config.Commands.ResetScale, function(src, args)
     end
 end, Config.Permission.RestrictCommandsWithAce == true)
 
-local function buildWeaponDamage()
-    if weaponDamageByHash then return weaponDamageByHash end
-
-    weaponDamageByHash = {}
-    for weaponName, damage in pairs(Config.HitboxGuard.WeaponChestDamage or {}) do
-        weaponDamageByHash[GetHashKey(weaponName)] = tonumber(damage) or 0
-    end
-
-    return weaponDamageByHash
-end
-
-local function chestDamageForWeapon(weaponHash)
-    local map = buildWeaponDamage()
-    local configured = map[tonumber(weaponHash)]
-    if configured ~= nil then return configured end
-    return tonumber(Config.HitboxGuard.DefaultChestDamage) or 0
-end
-
-RegisterNetEvent('crimson-pedscale:server:visualHeadHit', function(targetId, weaponHash)
-    if not Config.HitboxGuard.Enabled or (Config.HitboxGuard.Head or {}).Enabled == false then return end
-
-    local src = source
-    targetId = tonumber(targetId)
-    weaponHash = tonumber(weaponHash)
-
-    if not targetId or not weaponHash or targetId == src then return end
-    if not GetPlayerName(targetId) or not GetPlayerName(src) then return end
-
-    -- Use the same per-shooter/target rate limit as chest compensation.
-    local now = GetGameTimer()
-    local cooldown = tonumber(Config.HitboxGuard.ServerCooldownMs) or 95
-    lastVisualHit[src] = lastVisualHit[src] or {}
-    if lastVisualHit[src][targetId] and now - lastVisualHit[src][targetId] < cooldown then
-        return
-    end
-    lastVisualHit[src][targetId] = now
-
-    if Config.HitboxGuard.OnlyScaledTargets then
-        local targetScale = playerScales[targetId] or loadPlayerScale(targetId)
-        if isDefaultScale(targetScale) then return end
-    end
-
-    -- Reject weapons that this resource explicitly considers non-damaging
-    -- (stun guns are configured as 0), and reject absurdly distant reports.
-    local damage = chestDamageForWeapon(weaponHash)
-    if damage <= 0 then return end
-
-    local shooterPed = GetPlayerPed(src)
-    local targetPed = GetPlayerPed(targetId)
-    if shooterPed == 0 or targetPed == 0 then return end
-
-    local maxDistance = tonumber(Config.HitboxGuard.RayDistance) or 220.0
-    if #(GetEntityCoords(shooterPed) - GetEntityCoords(targetPed)) > (maxDistance + 5.0) then
-        return
-    end
-
-    local ok, selectedWeapon = pcall(GetSelectedPedWeapon, shooterPed)
-    if ok and selectedWeapon and selectedWeapon ~= 0 and selectedWeapon ~= weaponHash then
-        return
-    end
-
-    TriggerClientEvent('crimson-pedscale:client:applyVisualHeadshot', targetId, src, weaponHash)
-end)
-
-RegisterNetEvent('crimson-pedscale:server:visualChestHit', function(targetId, weaponHash)
-    if not Config.HitboxGuard.Enabled then return end
-
-    local src = source
-    targetId = tonumber(targetId)
-    weaponHash = tonumber(weaponHash)
-
-    if not targetId or not weaponHash or targetId == src then return end
-    if not GetPlayerName(targetId) or not GetPlayerName(src) then return end
-
-    local now = GetGameTimer()
-    local cooldown = tonumber(Config.HitboxGuard.ServerCooldownMs) or 95
-    lastVisualHit[src] = lastVisualHit[src] or {}
-    if lastVisualHit[src][targetId] and now - lastVisualHit[src][targetId] < cooldown then
-        return
-    end
-    lastVisualHit[src][targetId] = now
-
-    if Config.HitboxGuard.OnlyScaledTargets then
-        local targetScale = playerScales[targetId] or loadPlayerScale(targetId)
-        if isDefaultScale(targetScale) then return end
-    end
-
-    local damage = chestDamageForWeapon(weaponHash)
-    local maxDamage = tonumber(Config.HitboxGuard.MaxDamage) or 250
-    if damage <= 0 or damage > maxDamage then return end
-
-    local shooterPed = GetPlayerPed(src)
-    local targetPed = GetPlayerPed(targetId)
-    if shooterPed == 0 or targetPed == 0 then return end
-
-    local maxDistance = tonumber(Config.HitboxGuard.RayDistance) or 220.0
-    if #(GetEntityCoords(shooterPed) - GetEntityCoords(targetPed)) > (maxDistance + 5.0) then
-        return
-    end
-
-    local ok, selectedWeapon = pcall(GetSelectedPedWeapon, shooterPed)
-    if ok and selectedWeapon and selectedWeapon ~= 0 and selectedWeapon ~= weaponHash then
-        return
-    end
-
-    TriggerClientEvent('crimson-pedscale:client:applyVisualChestDamage', targetId, damage, src, weaponHash)
-end)
+-- v45: the hitbox guard has been REMOVED. The server no longer exposes
+-- visualHeadHit / visualChestHit, and no longer relays damage to any client.
+--
+-- Those events accepted a fully attacker-supplied target id and relayed a
+-- kill to the named victim with no proof a shot was ever fired. Measured on
+-- v44: 200 crafted events produced 200 forced deaths, roughly 10 per second,
+-- against any scaled player within 220m, through walls, by a player holding
+-- no permissions at all.
+--
+-- It is removed rather than hardened because the design is contradictory: the
+-- guard exists to compensate shots the engine scored as a MISS, so requiring
+-- proof the shot landed refuses exactly the case it exists for while
+-- double-damaging the hits that already landed. See the README.
 
 AddEventHandler('playerDropped', function()
     local src = source
     playerScales[src] = nil
     menuGrants[src] = nil
-    lastVisualHit[src] = nil
+    eventClock[src] = nil
+    abuseState[src] = nil
+
     TriggerClientEvent('crimson-pedscale:client:removeScale', -1, src)
+end)
+
+AddEventHandler('onResourceStart', function(resourceName)
+    if resourceName ~= GetCurrentResourceName() then return end
+    ReportPedScaleConfig('server')
+
 end)
